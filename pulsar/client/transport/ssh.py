@@ -7,6 +7,7 @@ SSH_OPTIONS = ['-o', 'StrictHostKeyChecking=no', '-o', 'PreferredAuthentications
 def rsync_get_file(uri_from, uri_to, user, host, port, key):
     cmd = [
         'rsync',
+        '-src',
         '-e',
         'ssh -i {} -p {} {}'.format(key, port, ' '.join(SSH_OPTIONS)),
         '{}@{}:{}'.format(user, host, uri_from),
@@ -19,6 +20,8 @@ def rsync_post_file(uri_from, uri_to, user, host, port, key):
     _ensure_dir(uri_to, key, port, user, host)
     cmd = [
         'rsync',
+        '-src',
+        '--chmod=F664,D775',
         '-e',
         'ssh -i {} -p {} {}'.format(key, port, ' '.join(SSH_OPTIONS)),
         uri_from,
