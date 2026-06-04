@@ -358,3 +358,18 @@ class PulsarOutputs:
         files_directory = "{}_files{}".format(basename(output_file)[0:-len(".dat")], self.path_helper.separator)
         names = filter(lambda o: o.startswith(files_directory), self.output_directory_contents)
         return dict(map(lambda name: (local_path(name), name), names))
+
+    def output_extra_files_dir(self, output_file):
+        """
+        Returns dict mapping local path to remote name.
+        """
+        print(output_file)
+        output_directory = dirname(output_file)
+
+        def local_path(name):
+            return join(output_directory, self.path_helper.local_name(name))
+
+        name = "{}_files{}".format(basename(output_file)[0:-len(".dat")], self.path_helper.separator)
+        edir = dict()
+        edir[local_path(name)] = name
+        return edir

@@ -1,14 +1,15 @@
 import os
 import subprocess
 
-SSH_OPTIONS = ['-o', 'StrictHostKeyChecking=no', '-o', 'PreferredAuthentications=publickey', '-o', 'PubkeyAuthentication=yes']
+SSH_OPTIONS = ['-o', 'PasswordAuthentication=no', '-o', 'GSSAPIAuthentication=yes', '-o', 'PubkeyAuthentication=no']
 
 
 def rsync_get_file(uri_from, uri_to, user, host, port, key):
     cmd = [
         'rsync',
+        '-src',
         '-e',
-        'ssh -i {} -p {} {}'.format(key, port, ' '.join(SSH_OPTIONS)),
+        'ssh -p {} {}'.format(port, ' '.join(SSH_OPTIONS)),
         '{}@{}:{}'.format(user, host, uri_from),
         uri_to,
     ]
@@ -19,8 +20,10 @@ def rsync_post_file(uri_from, uri_to, user, host, port, key):
     _ensure_dir(uri_to, key, port, user, host)
     cmd = [
         'rsync',
+        '-src',
+        '--chmod=F664,D775',
         '-e',
-        'ssh -i {} -p {} {}'.format(key, port, ' '.join(SSH_OPTIONS)),
+        'ssh -p {} {}'.format(port, ' '.join(SSH_OPTIONS)),
         uri_from,
         '{}@{}:{}'.format(user, host, uri_to),
     ]

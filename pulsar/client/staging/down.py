@@ -118,7 +118,8 @@ class ResultsCollector:
             if output_generated:
                 self._attempt_collect_output('output', output_file)
 
-            for galaxy_path, pulsar in self.pulsar_outputs.output_extras(output_file).items():
+            for galaxy_path, pulsar in self.pulsar_outputs.output_extra_files_dir(output_file).items():
+#                log.info("Extra files: {}, {}".format(galaxy_path, pulsar))
                 self._attempt_collect_output('output', path=galaxy_path, name=pulsar)
             # else not output generated, do not attempt download.
 
