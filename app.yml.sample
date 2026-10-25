@@ -32,6 +32,21 @@
 #    ## example in the "Galaxy Configuration" section of Pulsar's docs:
 #    ## https://pulsar.readthedocs.io/en/latest/galaxy_conf.html
 
+    ## Shell injected immediately before / after the main job command in the
+    ## generated job script (runs on the compute node, in the job's working
+    ## directory). Accepts a single (multi-line) string or a YAML list with one
+    ## command per line; to run a script use `source /path/pre.sh` or a path to
+    ## an executable. These merge with - never replace - any job metrics
+    ## instrumentation (see job_metrics_config.yml), so both your commands and
+    ## the metrics collectors run. Setting these at the top level of this file
+    ## (or via PULSAR_CONFIG_JOB_PRE_COMMANDS / PULSAR_CONFIG_JOB_POST_COMMANDS
+    ## exported in local_env.sh) makes them the default for every manager,
+    ## overridable per manager here.
+    #job_pre_commands:
+    #  - "source /opt/cesnet/env/pre.sh"
+    #  - "echo starting on $(hostname)"
+    #job_post_commands: "echo finished; /opt/cesnet/env/cleanup.sh"
+
 
 ## Mode to create job releated directories with. If unset
 ## will just use 0777 with umask mask applied.

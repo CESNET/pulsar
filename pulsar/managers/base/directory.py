@@ -295,6 +295,12 @@ class DirectoryBaseManager(BaseManager):
             "tmp_dir_creation_statement": self._tmp_dir(job_id),
             "prepare_dirs_statement": self._prepare_dirs(job_id),
         }
+        # Per-manager pre/post commands; job_script merges these with the
+        # job-instrumenter's own pre/post commands rather than replacing them.
+        if self.job_pre_commands:
+            job_template_env["instrument_pre_commands"] = self.job_pre_commands
+        if self.job_post_commands:
+            job_template_env["instrument_post_commands"] = self.job_post_commands
         if command_line:
             job_template_env["command"] = command_line
         return job_template_env

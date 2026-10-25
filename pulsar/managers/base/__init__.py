@@ -98,6 +98,20 @@ def get_id_assigner(assign_ids):
     return ID_ASSIGNER.get(assign_ids, default_id_assigner)
 
 
+def normalize_commands(value) -> str:
+    """Render a configured command value into shell for the job script.
+
+    Accepts a YAML list (one command per line) or a single (possibly
+    multi-line) string, and returns newline-joined shell. Empty/None becomes
+    an empty string so callers can test the result directly.
+    """
+    if not value:
+        return ""
+    if isinstance(value, (list, tuple)):
+        return "\n".join(str(line) for line in value if str(line).strip())
+    return str(value)
+
+
 class BaseManager(ManagerInterface, ABC):
 
     def __init__(self, name: str, app: "PulsarApp", **kwds):
@@ -114,6 +128,18 @@ class BaseManager(ManagerInterface, ABC):
         # Default cvmfsexec configuration for this manager (app.yml). May be
         # overridden per job by a ``cvmfsexec`` entry in setup_params.
         self.cvmfsexec_config = parse_cvmfsexec_config(kwds.get("cvmfsexec"))
+        # Shell injected immediately before/after the main job command in the
+        # generated job script. Configurable per manager in app.yml (with the
+        # legacy ``instrument_*`` names accepted as aliases); a top-level app.yml
+        # value or a PULSAR_CONFIG_* env var (e.g. from local_env.sh) acts as the
+        # global default via manager_factory. Merged with the job-instrumenter's
+        # own commands (see job_script) so job metrics are preserved.
+        self.job_pre_commands = normalize_commands(
+            kwds.get("job_pre_commands") or kwds.get("instrument_pre_commands")
+        )
+        self.job_post_commands = normalize_commands(
+            kwds.get("job_post_commands") or kwds.get("instrument_post_commands")
+        )
         self.debug = str(kwds.get("debug", False)).lower() == "true"
         self.authorizer = app.authorizer
         self.user_auth_manager = app.user_auth_manager
