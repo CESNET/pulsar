@@ -1,10 +1,19 @@
 import os
 import tempfile
 from collections import deque
+from types import SimpleNamespace
+from unittest.mock import (
+    patch,
+    PropertyMock,
+)
 
 from pulsar.client.client import JobClient
-from pulsar.client.decorators import MAX_RETRY_COUNT, retry
+from pulsar.client.decorators import (
+    MAX_RETRY_COUNT,
+    retry,
+)
 from pulsar.client.manager import HttpPulsarInterface
+from pulsar.client.tes import TesPollingCoexecutionJobClient
 from pulsar.client.transport import UrllibTransport
 
 
@@ -59,7 +68,7 @@ class TestClient(JobClient):
 
     def __init__(self):
         JobClient.__init__(self, {}, "543", HttpPulsarInterface({"url": "http://test:803/"}, TestTransport(self)))
-        self.expects = deque([])
+        self.expects = deque()
 
     def expect_open(self, checker, response):
         self.expects.appendleft((checker, response))
@@ -82,7 +91,7 @@ class RequestChecker:
         assert opened_url.startswith(expected_url_prefix)
         url_suffix = opened_url[len(expected_url_prefix):]
         actual_args = dict([key_val_combo.split("=") for key_val_combo in url_suffix.split("&")])
-        statement = "Expected args {}, obtained {}".format(self.expected_args, actual_args)
+        statement = f"Expected args {self.expected_args}, obtained {actual_args}"
         assert self.expected_args == actual_args, statement
 
     def check_data(self, data):
@@ -92,7 +101,7 @@ class RequestChecker:
             assert self.data == data
         else:
             data_read = data.read(1024)
-            assert data_read == self.data, "data_read {} is not expected data {}".format(data_read, self.data)
+            assert data_read == self.data, f"data_read {data_read} is not expected data {self.data}"
 
     def __call__(self, request, data=None):
         self.called = True
@@ -180,7 +189,7 @@ def test_download_output():
 
     with open(temp_file.name) as f:
         contents = f.read(1024)
-        assert contents == "test output contents", "Unxpected contents %s" % contents
+        assert contents == "test output contents", "Unexpected contents %s" % contents
 
 
 def test_get_status_queued():
@@ -205,3 +214,53 @@ def test_clean():
     client.expect_open(request_checker, 'OK')
     client.clean()
     request_checker.assert_called()
+
+
+def _tes_client_stub(job_id="543", external_id=None):
+    client = object.__new__(TesPollingCoexecutionJobClient)
+    client.job_id = job_id
+    client.external_id = external_id
+    return client
+
+
+class RecordingTesClient:
+    def __init__(self):
+        self.cancelled = []
+        self.polled = []
+
+    def cancel_task(self, task_id):
+        self.cancelled.append(task_id)
+
+    def get_task(self, task_id, view):
+        self.polled.append((task_id, view))
+        return SimpleNamespace(state=None)
+
+
+def test_client_reads_external_id():
+    interface = HttpPulsarInterface({"url": "http://test:803/"}, TestTransport(None))
+    client = JobClient({"external_id": "tes-task-abc"}, "543", interface)
+    assert client.external_id == "tes-task-abc"
+    assert JobClient({}, "543", interface).external_id is None
+
+
+def test_tes_task_id_falls_back_to_galaxy_job_id():
+    client = _tes_client_stub()
+    assert client._tes_task_id == "543"
+
+
+def test_tes_poll_and_cancel_use_recorded_external_id():
+    client = _tes_client_stub(external_id="tes-task-abc")
+    tes_client = RecordingTesClient()
+    with patch.object(
+        TesPollingCoexecutionJobClient,
+        "_tes_client",
+        new_callable=PropertyMock,
+        return_value=tes_client,
+    ), patch("pulsar.client.tes.tes_state_to_pulsar_status", return_value="running"), patch(
+        "pulsar.client.tes.tes_state_is_complete", return_value=False
+    ):
+        client.kill()
+        client.raw_check_complete()
+
+    assert tes_client.cancelled == ["tes-task-abc"]
+    assert tes_client.polled == [("tes-task-abc", "FULL")]

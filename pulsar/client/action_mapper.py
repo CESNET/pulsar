@@ -19,6 +19,7 @@ from re import (
 )
 from typing import (
     Any,
+    ClassVar,
     Dict,
     List,
     Type,
@@ -79,6 +80,10 @@ path_type = Bunch(
     # Other fixed tool parameter paths (likely coming from tool data, but not
     # necessarily).
     UNSTRUCTURED="unstructured",
+    # Resolved container image path (e.g. a Singularity/Apptainer image on
+    # CVMFS). Resolved on the Galaxy host but read on the compute node, which
+    # may expose the image at a different path. Never staged.
+    CONTAINER="container",
 )
 
 
@@ -94,7 +99,7 @@ ACTION_DEFAULT_PATH_TYPES = [
     path_type.OUTPUT_METADATA,
     path_type.OUTPUT_JOBDIR,
 ]
-ALL_PATH_TYPES = ACTION_DEFAULT_PATH_TYPES + [path_type.UNSTRUCTURED]
+ALL_PATH_TYPES = [*ACTION_DEFAULT_PATH_TYPES, path_type.UNSTRUCTURED, path_type.CONTAINER]
 
 MISSING_FILES_ENDPOINT_ERROR = "Attempted to use remote_transfer action without defining a files_endpoint."
 MISSING_SSH_KEY_ERROR = "Attempt to use file transfer action requiring an SSH key without specifying a ssh_key."
@@ -137,6 +142,12 @@ class FileActionMapper:
     True
     >>> # Always at least copy work_dir outputs.
     >>> action = mapper.action({'path': '/opt/galaxy/database/working_directory/45.sh'}, 'workdir')
+    >>> action.action_type == u'copy'
+    True
+    >>> action.staging_needed
+    True
+    >>> # Always at least copy input metadata files.
+    >>> action = mapper.action({'path': '/opt/galaxy/database/working_directory/metadata'}, 'metadata')
     >>> action.action_type == u'copy'
     True
     >>> action.staging_needed
@@ -211,15 +222,15 @@ class FileActionMapper:
         return filter(lambda m: path_type.UNSTRUCTURED in m.path_types, self.mappers)
 
     def to_dict(self):
-        return dict(
-            default_action=self.default_action,
-            files_endpoint=self.files_endpoint,
-            ssh_key=self.ssh_key,
-            ssh_user=self.ssh_user,
-            ssh_port=self.ssh_port,
-            ssh_host=self.ssh_host,
-            paths=list(map(lambda m: m.to_dict(), self.mappers))
-        )
+        return {
+            'default_action': self.default_action,
+            'files_endpoint': self.files_endpoint,
+            'ssh_key': self.ssh_key,
+            'ssh_user': self.ssh_user,
+            'ssh_port': self.ssh_port,
+            'ssh_host': self.ssh_host,
+            'paths': [m.to_dict() for m in self.mappers]
+        }
 
     def __client_to_config(self, client):
         action_config_path = client.action_config_path
@@ -250,11 +261,11 @@ class FileActionMapper:
         action_type = self.default_action if type in ACTION_DEFAULT_PATH_TYPES else "none"
         if mapper:
             action_type = mapper.action_type
-        if type in ["workdir", "jobdir", "output_workdir", "output_metadata", "output_jobdir"] and action_type == "none":
+        if type in ["workdir", "jobdir", "metadata", "output_workdir", "output_metadata", "output_jobdir"] and action_type == "none":
             # We are changing the working_directory/job_directory relative to what
             # Galaxy would use, these need to be copied over.
             action_type = "copy"
-        action_class = actions.get(action_type, None)
+        action_class = actions.get(action_type)
         if action_class is None:
             message_template = "Unknown action_type encountered %s while trying to map path %s"
             message_args = (action_type, path)
@@ -298,7 +309,7 @@ UNSET_ACTION_KWD = "__UNSET__"
 
 class BaseAction:
     whole_directory_transfer_supported = False
-    action_spec: Dict[str, Any] = {}
+    action_spec: ClassVar[Dict[str, Any]] = {}
     action_type: str
 
     def __init__(self, source, file_lister=None):
@@ -341,11 +352,11 @@ class BaseAction:
         )
 
     def _extend_base_dict(self, **kwds):
-        base_dict = dict(
-            path=self.path,  # For older Pulsar servers (pre-0.13.0?)
-            source=self.source,
-            action_type=self.action_type,
-        )
+        base_dict = {
+            'path': self.path,  # For older Pulsar servers (pre-0.13.0?)
+            'source': self.source,
+            'action_type': self.action_type,
+        }
         base_dict.update(**kwds)
         return base_dict
 
@@ -363,7 +374,7 @@ class BaseAction:
                 first = False
             else:
                 attribute_str += ","
-            attribute_str += "{}={}".format(key, value)
+            attribute_str += f"{key}={value}"
         return "FileAction[%s]" % attribute_str
 
 
@@ -390,10 +401,10 @@ class RewriteAction(BaseAction):
     """ This actin indicates the Pulsar server should simply rewrite the path
     to the specified file.
     """
-    action_spec = dict(
-        source_directory=REQUIRED_ACTION_KWD,
-        destination_directory=REQUIRED_ACTION_KWD
-    )
+    action_spec: ClassVar[Dict[str, Any]] = {
+        'source_directory': REQUIRED_ACTION_KWD,
+        'destination_directory': REQUIRED_ACTION_KWD
+    }
     action_type = "rewrite"
     staging = STAGING_ACTION_NONE
 
@@ -453,7 +464,8 @@ class RemoteCopyAction(BaseAction):
         return RemoteCopyAction(source=action_dict["source"])
 
     def write_to_path(self, path):
-        copy_to_path(open(self.path, "rb"), path)
+        with open(self.path, "rb") as f:
+            copy_to_path(f, path)
 
     def write_from_path(self, pulsar_path):
         destination = self.path
@@ -464,14 +476,12 @@ class RemoteCopyAction(BaseAction):
             copy_to_path(f, destination)
 
 
-class RemoteTransferAction(BaseAction):
-    """ This action indicates the Pulsar server should transfer the file before
-    execution via one of the remote transfer implementations. This is like a TransferAction, but
-    it indicates the action requires network access to the staging server, and
-    should be executed via ssh/rsync/etc
+class BaseRemoteTransferAction(BaseAction):
+    """ The Pulsar server transfers the file itself, over HTTP from the staging
+    server's URL. Like a TransferAction, but it needs network access to the staging
+    server. Subclasses differ only in how outputs are uploaded.
     """
     inject_url = True
-    action_type = "remote_transfer"
     staging = STAGING_ACTION_REMOTE
 
     def __init__(self, source, file_lister=None, url=None):
@@ -483,38 +493,25 @@ class RemoteTransferAction(BaseAction):
 
     @classmethod
     def from_dict(cls, action_dict):
-        return RemoteTransferAction(source=action_dict["source"], url=action_dict["url"])
+        return cls(source=action_dict["source"], url=action_dict["url"])
 
     def write_to_path(self, path):
         get_file(self.url, path)
+
+
+class RemoteTransferAction(BaseRemoteTransferAction):
+    """ Uploads outputs with a multipart POST.
+    """
+    action_type = "remote_transfer"
 
     def write_from_path(self, pulsar_path):
         post_file(self.url, pulsar_path)
 
 
-class RemoteTransferTusAction(BaseAction):
-    """ This action indicates the Pulsar server should transfer the file before
-    execution via one of the remote transfer implementations. This is like a TransferAction, but
-    it indicates the action requires network access to the staging server and TUS
-    will be used for the transfer
+class RemoteTransferTusAction(BaseRemoteTransferAction):
+    """ Uploads outputs with TUS resumable uploads.
     """
-    inject_url = True
     action_type = "remote_transfer_tus"
-    staging = STAGING_ACTION_REMOTE
-
-    def __init__(self, source, file_lister=None, url=None):
-        super().__init__(source, file_lister=file_lister)
-        self.url = url
-
-    def to_dict(self):
-        return self._extend_base_dict(url=self.url)
-
-    @classmethod
-    def from_dict(cls, action_dict):
-        return RemoteTransferAction(source=action_dict["source"], url=action_dict["url"])
-
-    def write_to_path(self, path):
-        get_file(self.url, path)
 
     def write_from_path(self, pulsar_path):
         tus_upload_file(self.url, pulsar_path)
@@ -541,7 +538,8 @@ class RemoteObjectStoreCopyAction(BaseAction):
             object_store_id=object_store_ref["object_store_id"],
         )
         filename = self.object_store.get_filename(dataset_object)
-        copy_to_path(open(filename, 'rb'), path)
+        with open(filename, "rb") as f:
+            copy_to_path(f, path)
 
     def write_from_path(self, pulsar_path):
         raise NotImplementedError("Writing raw files to object store not supported at this time.")
@@ -551,12 +549,12 @@ class PubkeyAuthenticatedTransferAction(BaseAction):
     """Base class for file transfers requiring an SSH public/private key
     """
     inject_ssh_properties = True
-    action_spec = dict(
-        ssh_key=UNSET_ACTION_KWD,
-        ssh_user=UNSET_ACTION_KWD,
-        ssh_host=UNSET_ACTION_KWD,
-        ssh_port=UNSET_ACTION_KWD,
-    )
+    action_spec: ClassVar[Dict[str, Any]] = {
+        'ssh_key': UNSET_ACTION_KWD,
+        'ssh_user': UNSET_ACTION_KWD,
+        'ssh_host': UNSET_ACTION_KWD,
+        'ssh_port': UNSET_ACTION_KWD,
+    }
     staging = STAGING_ACTION_REMOTE
 
     def __init__(self, source, file_lister=None, ssh_user=UNSET_ACTION_KWD,
@@ -660,14 +658,15 @@ class MessageAction:
         return self.client.prefer_local_staging
 
     def to_dict(self):
-        return dict(contents=self.contents, action_type=MessageAction.action_type)
+        return {'contents': self.contents, 'action_type': MessageAction.action_type}
 
     @classmethod
     def from_dict(cls, action_dict):
         return MessageAction(contents=action_dict["contents"])
 
     def write_to_path(self, path):
-        open(path, "w").write(self.contents)
+        with open(path, "w") as f:
+            f.write(self.contents)
 
 
 DICTIFIABLE_ACTION_CLASSES = [
@@ -705,7 +704,7 @@ class BasePathMapper:
 
     def __init__(self, config):
         action_type = config.get('action', DEFAULT_MAPPED_ACTION)
-        action_class = actions.get(action_type, None)
+        action_class = actions.get(action_type)
         action_kwds = action_class.action_spec.copy()
         for key, value in action_kwds.items():
             if key in config:
@@ -730,11 +729,11 @@ class BasePathMapper:
         return rval
 
     def _extend_base_dict(self, **kwds):
-        base_dict = dict(
-            action=self.action_type,
-            path_types=",".join(self.path_types),
-            match_type=self.match_type
-        )
+        base_dict = {
+            'action': self.action_type,
+            'path_types': ",".join(self.path_types),
+            'match_type': self.match_type
+        }
         base_dict.update(self.file_lister.to_dict())
         base_dict.update(self.action_kwds)
         base_dict.update(**kwds)
@@ -768,7 +767,7 @@ class PrefixPathMapper(BasePathMapper):
         return path is not None and path.startswith(self.prefix_path)
 
     def to_pattern(self):
-        pattern_str = r"({}{}[^\s,\"\']+)".format(escape(self.prefix_path), escape(sep))
+        pattern_str = rf"({escape(self.prefix_path)}{escape(sep)}[^\s,\"\']+)"
         return compile(pattern_str)
 
     def to_dict(self):
@@ -811,11 +810,11 @@ class RegexPathMapper(BasePathMapper):
 
 
 MAPPER_CLASSES = [PathTypeOnlyMapper, PrefixPathMapper, GlobPathMapper, RegexPathMapper]
-MAPPER_CLASS_DICT = dict(map(lambda c: (c.match_type, c), MAPPER_CLASSES))
+MAPPER_CLASS_DICT = {c.match_type: c for c in MAPPER_CLASSES}
 
 
 def mappers_from_dicts(mapper_def_list):
-    return list(map(lambda m: _mappper_from_dict(m), mapper_def_list))
+    return [_mappper_from_dict(m) for m in mapper_def_list]
 
 
 def _mappper_from_dict(mapper_dict):
@@ -832,9 +831,9 @@ class FileLister:
         self.depth = int(config.get("depth", "0"))
 
     def to_dict(self):
-        return dict(
-            depth=self.depth
-        )
+        return {
+            'depth': self.depth
+        }
 
     def unstructured_map(self, path):
         depth = self.depth
@@ -847,7 +846,7 @@ class FileLister:
             return {join(path, f): f for f in directory_files(path)}
 
 
-DEFAULT_FILE_LISTER = FileLister(dict(depth=0))
+DEFAULT_FILE_LISTER = FileLister({'depth': 0})
 
 ACTION_CLASSES: List[Type[BaseAction]] = [
     NoneAction,
@@ -866,8 +865,8 @@ actions = {clazz.action_type: clazz for clazz in ACTION_CLASSES}
 
 __all__ = (
     'FileActionMapper',
-    'path_type',
-    'from_dict',
     'MessageAction',
     'RemoteTransferAction',  # For testing
+    'from_dict',
+    'path_type',
 )

@@ -1,11 +1,18 @@
 from os import makedirs
-from os.path import join, dirname, exists
+from os.path import (
+    dirname,
+    exists,
+    join,
+)
 from string import Template
-from galaxy.util.bunch import Bunch
-from galaxy.objectstore import build_object_store_from_config
 
-from .test_utils import TempDirectoryTestCase
-from .test_utils import skip
+from galaxy.objectstore import build_object_store_from_config
+from galaxy.util.bunch import Bunch
+
+from .test_utils import (
+    skip,
+    TempDirectoryTestCase,
+)
 
 
 class MockDataset:
@@ -40,10 +47,10 @@ class PulsarObjectStoreTest(TempDirectoryTestCase):
             config_contents = config_template.safe_substitute(temp_directory=self.temp_directory)
             configf.write(config_contents)
 
-        app_conf = dict(
-            object_store_config_file=object_store_config_file,
-            private_token="12345",
-        )
+        app_conf = {
+            "object_store_config_file": object_store_config_file,
+            "private_token": "12345",
+        }
         from .test_utils import test_pulsar_server
         with test_pulsar_server(app_conf=app_conf) as server:
             url = server.application_url

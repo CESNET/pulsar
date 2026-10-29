@@ -10,6 +10,10 @@ from os.path import (
 
 from ..action_mapper import FileActionMapper
 from ..staging import COMMAND_VERSION_FILENAME
+from ..transport.transient import (
+    http_status_code,
+    is_transport_error,
+)
 
 log = getLogger(__name__)
 
@@ -107,7 +111,7 @@ class ResultsCollector:
                 try:
                     self.output_files.remove(output_file)
                 except ValueError:
-                    raise Exception("Failed to remove {} from {}".format(output_file, self.output_files))
+                    raise Exception(f"Failed to remove {output_file} from {self.output_files}")
 
     def __collect_outputs(self):
         # Legacy Pulsar not returning list of files, iterate over the list of
@@ -169,7 +173,6 @@ class ResultsCollector:
                 record_references(as_dict)
             except Exception as e:
                 log.warning("problem parsing galaxy.json %s" % e)
-                pass
 
         realized_dynamic_file_sources = (self.pulsar_outputs.realized_dynamic_file_sources or [])
         for realized_dynamic_file_source in realized_dynamic_file_sources:
@@ -193,16 +196,18 @@ class ResultsCollector:
         # Fetch remaining working directory outputs of interest.
         for name in contents:
             collect = False
-            if self.client_outputs.dynamic_match(name):
-                collect = True
-            elif name in dynamic_file_source_references["filename"] or any(name.startswith(r) for r in dynamic_file_source_references["extra_files"]):
+            if (
+                self.client_outputs.dynamic_match(name)
+                or name in dynamic_file_source_references["filename"]
+                or any(name.startswith(r) for r in dynamic_file_source_references["extra_files"])
+            ):
                 collect = True
 
             if collect:
                 output_file = join(directory, self.pulsar_outputs.path_helper.local_name(name))
                 if (name, output_file) in self.downloaded_working_directory_files:
                     continue
-                log.debug("collecting dynamic {} file {}".format(output_type, name))
+                log.debug(f"collecting dynamic {output_type} file {name}")
                 if self._attempt_collect_output(output_type=output_type, path=output_file, name=name):
                     self.downloaded_working_directory_files.append((name, output_file))
 
@@ -219,11 +224,32 @@ class ResultsCollector:
         return collected
 
     def _collect_output(self, output_type, action, name):
-        log.info("collecting output {} with action {}".format(name, action))
+        log.info(f"collecting output {name} with action {action}")
         try:
             return self.output_collector.collect_output(self, output_type, action, name)
+        except (ImportError, MemoryError, SystemError):
+            # Genuine infrastructure failures must never be downgraded.
+            raise
         except Exception as e:
-            if _allow_collect_failure(output_type):
+            if http_status_code(e) == 403:
+                # The Galaxy server authoritatively refused this upload (HTTP
+                # 403). The usual cause is the output's dataset being purged or
+                # deleted while the job ran — Galaxy is the source of truth for
+                # the dataset's state, retrying cannot help, and the tool itself
+                # ran, so this must not fail the job. Surface the path/output so
+                # the reason is visible rather than a generic failure.
+                #
+                # Checked before the OSError branch below because
+                # requests.HTTPError is itself an OSError subclass.
+                log.warning(
+                    "Galaxy refused output '%s' (HTTP 403) at %s; not failing the job. "
+                    "This is expected when the output dataset was purged or deleted "
+                    "while the job was running.",
+                    name,
+                    getattr(action, "url", None) or getattr(action, "path", action),
+                )
+                return False
+            if _allow_collect_failure(output_type, e):
                 log.warning(
                     "Allowed failure in postprocessing, will not force job failure but generally indicates a tool"
                     f" failure: {e}")
@@ -256,11 +282,33 @@ def _clean(collection_failure_exceptions, cleanup_job, client):
         try:
             client.clean()
         except Exception:
-            log.warn("Failed to cleanup remote Pulsar job")
+            log.warning("Failed to cleanup remote Pulsar job")
 
 
-def _allow_collect_failure(output_type):
-    return output_type in ['output_workdir']
+def _allow_collect_failure(output_type, exception):
+    """Whether a collection failure may be downgraded to a warning instead of failing the job.
+
+    Only working-directory outputs are eligible: a failure collecting one
+    generally indicates a tool problem rather than an infrastructure one, so it
+    should not force the job to fail.
+
+    Infrastructure failures are never downgraded, even for working-directory
+    outputs — they must fail the job, or a job that never staged its data out
+    reports as green in Galaxy with zero-length outputs. Two shapes count:
+    ``OSError`` (disk full, local I/O, and the requests transport, whose
+    ``HTTPError`` is an ``OSError``) and ``PulsarClientTransportError`` (the
+    curl and urllib transports, which subclass plain ``Exception``).
+
+    A missing output file (``FileNotFoundError``) is excluded from that rule: it
+    is an expected, recoverable condition — e.g. a ``from_work_dir`` output a
+    tool legitimately did not produce, which Galaxy represents as an empty
+    dataset — so it remains an allowed failure.
+    """
+    if output_type not in ['output_workdir']:
+        return False
+    if isinstance(exception, OSError) and not isinstance(exception, FileNotFoundError):
+        return False
+    return not is_transport_error(exception)
 
 
 __all__ = ('finish_job',)

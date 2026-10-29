@@ -1,43 +1,60 @@
 """Utilities allowing for high-level testing throughout Pulsar."""
 
-import os
 import configparser
+import os
+import subprocess
 import sys
 import threading
+import time
 import traceback
 from contextlib import contextmanager
-from stat import S_IXGRP, S_IXOTH
-from os import pardir, stat, chmod, access, X_OK, pathsep, environ
-from os import makedirs, listdir, system
-from os.path import join, dirname, isfile, split
+from os import (
+    access,
+    chmod,
+    environ,
+    listdir,
+    makedirs,
+    pardir,
+    pathsep,
+    stat,
+    X_OK,
+)
+from os.path import (
+    dirname,
+    isfile,
+    join,
+    split,
+)
 from pathlib import Path
-from tempfile import mkdtemp
 from shutil import rmtree
+from stat import (
+    S_IXGRP,
+    S_IXOTH,
+)
+from tempfile import mkdtemp
 from typing import (
     Any,
+    Callable,
     Dict,
     Optional,
+    TypeVar,
+)
+from unittest import (
+    skip,
+    TestCase,
 )
 
-import time
-
 import pytest
-from webtest import TestApp
-from webtest.http import StopableWSGIServer
-
 from galaxy.job_metrics import NULL_JOB_INSTRUMENTER
 from galaxy.util.bunch import Bunch
 from simplejobfiles.app import JobFilesApp
+from webtest import TestApp
+from webtest.http import StopableWSGIServer
 
+from pulsar.managers.base import JobDirectory
 from pulsar.managers.util import drmaa
 from pulsar.tools import ToolBox
-from pulsar.managers.base import JobDirectory
 from pulsar.user_auth.manager import UserAuthManager
-
-from unittest import TestCase, skip
-
-import stopit
-from functools import wraps
 
 
 class MarkGenerator:
@@ -48,26 +65,39 @@ class MarkGenerator:
 mark = MarkGenerator()
 
 
-def timed(timeout):
-    def outer_wrapper(f):
-        @wraps(f)
-        def wrapper(*args, **kwargs):
-            with stopit.ThreadingTimeout(timeout) as to_ctx_mgr:
-                f(*args, **kwargs)
-            if to_ctx_mgr.state != to_ctx_mgr.EXECUTED:
-                raise Exception("Test function timed out.")
-
-        return wrapper
-
-    return outer_wrapper
-
-
 INTEGRATION_MAXIMUM_TEST_TIME = 120
-integration_test = timed(INTEGRATION_MAXIMUM_TEST_TIME)
+integration_test = pytest.mark.timeout(INTEGRATION_MAXIMUM_TEST_TIME)
 
 TEST_DIR = dirname(__file__)
 ROOT_DIR = join(TEST_DIR, pardir)
-TEST_TEMPDIR_PREFIX = 'tmp_pulsar_'
+TEST_TEMPDIR_PREFIX = "tmp_pulsar_"
+
+
+T = TypeVar("T")
+
+
+def wait_for(
+    poll: Callable[[], T],
+    description: str,
+    until: Optional[Callable[[T], bool]] = None,
+    timeout: float = 5,
+    interval: float = 0.01,
+) -> T:
+    """Poll until ``poll()`` is truthy - or satisfies ``until`` - and return that value.
+
+    ``description`` completes "waiting for ...". On timeout this raises ``AssertionError``
+    with it, plus the last polled value when ``until`` is given.
+    """
+    time_end = time.time() + timeout
+    while True:
+        value = poll()
+        done = until(value) if until else value
+        if done:
+            return value
+        if time.time() >= time_end:
+            last = f", last value: {value!r}" if until else ""
+            raise AssertionError(f"Timed out after {timeout}s waiting for {description}{last}.")
+        time.sleep(interval)
 
 
 class TempDirectoryTestCase(TestCase):
@@ -92,8 +122,8 @@ def get_test_tool():
 class TestManager:
 
     def setup_temp_directory(self):
-        self.temp_directory = temp_directory_persist(prefix='test_manager_')
-        self.__job_directory = JobDirectory(self.temp_directory, '1')
+        self.temp_directory = temp_directory_persist(prefix="test_manager_")
+        self.__job_directory = JobDirectory(self.temp_directory, "1")
 
     def cleanup_temp_directory(self):
         rmtree(self.temp_directory)
@@ -104,12 +134,12 @@ class TestManager:
 
 @contextmanager
 def temp_job_directory():
-    with temp_directory(prefix='job_') as directory:
-        yield JobDirectory(directory, '1')
+    with temp_directory(prefix="job_") as directory:
+        yield JobDirectory(directory, "1")
 
 
 @contextmanager
-def temp_directory(prefix=''):
+def temp_directory(prefix=""):
     directory = temp_directory_persist(prefix=prefix)
     try:
         yield directory
@@ -117,7 +147,7 @@ def temp_directory(prefix=''):
         rmtree(directory)
 
 
-def temp_directory_persist(prefix=''):
+def temp_directory_persist(prefix=""):
     return mkdtemp(prefix=TEST_TEMPDIR_PREFIX + prefix)
 
 
@@ -155,9 +185,31 @@ class TestAuthorization:
 
 
 class TestDependencyManager:
+    __test__ = False  # not a pytest test class
+
+    def __init__(self, dependency_resolvers=None, default_base_path=None):
+        self.dependency_resolvers = dependency_resolvers or []
+        self.default_base_path = default_base_path
 
     def dependency_shell_commands(self, requirements, **kwds):
         return []
+
+
+class RecordingRelayTransport:
+    """Stand-in for ``RelayTransport`` that records ``post_message`` calls.
+
+    Set ``raise_on_post`` to make the next post raise that exception
+    (covers the "transport throws" branches without ``unittest.mock``).
+    """
+
+    def __init__(self, raise_on_post=None):
+        self.calls = []  # list of (topic, payload)
+        self.raise_on_post = raise_on_post
+
+    def post_message(self, topic, payload):
+        self.calls.append((topic, payload))
+        if self.raise_on_post is not None:
+            raise self.raise_on_post
 
 
 class BaseManagerTestCase(TestCase):
@@ -179,7 +231,7 @@ python -c "import sys; sys.stdout.write(\'Hello World!\'); sys.stdout.flush(); s
         manager.launch(job_id, command)
 
         time_end = None if timeout is None else time.time() + timeout
-        while manager.get_status(job_id) not in ['complete', 'cancelled']:
+        while manager.get_status(job_id) not in ["complete", "cancelled"]:
             if time_end and time.time() > time_end:
                 raise Exception("Timeout.")
         self.assertEqual(manager.job_stderr_contents(job_id), b"")
@@ -205,42 +257,50 @@ python -c "import sys; sys.stdout.write(\'Hello World!\'); sys.stdout.flush(); s
         return 'python -c "%s"' % "; ".join(code.split("\n"))
 
     def _assert_status_becomes_cancelled(self, job_id, manager):
-        i = 0
-        while True:
-            i += 1
-            status = manager.get_status(job_id)
-            if status in ["complete", "failed"]:
-                raise AssertionError("Expected cancelled status but got %s." % status)
-            elif status == "cancelled":
-                break
-            time.sleep(0.01)
-            if i > 100:  # Wait one second
-                raise AssertionError("Job failed to cancel quickly.")
+        status = wait_for(
+            lambda: manager.get_status(job_id),
+            "the job to cancel",
+            until=lambda polled: polled in ["cancelled", "complete", "failed"],
+            timeout=2,
+        )
+        if status != "cancelled":
+            raise AssertionError("Expected cancelled status but got %s." % status)
 
 
 def minimal_app_for_managers():
-    """ Minimimal app description for consumption by managers.
-    """
-    staging_directory = temp_directory_persist(prefix='minimal_app_')
+    """Minimimal app description for consumption by managers."""
+    staging_directory = temp_directory_persist(prefix="minimal_app_")
     rmtree(staging_directory)
     authorizer = TestAuthorizer()
     user_auth_manager = get_test_user_auth_manager()
-    return Bunch(staging_directory=staging_directory,
-                 authorizer=authorizer,
-                 job_metrics=NullJobMetrics(),
-                 dependency_manager=TestDependencyManager(),
-                 user_auth_manager=user_auth_manager,
-                 object_store=object())
+    return Bunch(
+        staging_directory=staging_directory,
+        persistence_directory=staging_directory,
+        authorizer=authorizer,
+        job_metrics=NullJobMetrics(),
+        dependency_manager=TestDependencyManager(),
+        user_auth_manager=user_auth_manager,
+        object_store=object(),
+    )
 
 
 def get_test_user_auth_manager():
-    config = {"user_auth": {"authentication": [{"type": "allow_all"}], "authorization": [{"type": "allow_all"}]}}
+    config = {
+        "user_auth": {
+            "authentication": [{"type": "allow_all"}],
+            "authorization": [{"type": "allow_all"}],
+        }
+    }
     return UserAuthManager(config)
 
 
 def get_failing_user_auth_manager():
-    config = {"user_auth": {"authentication": [{"type": "allow_all"}],
-                            "authorization": [{"type": "userlist", "userlist_allowed_users": []}]}}
+    config = {
+        "user_auth": {
+            "authentication": [{"type": "allow_all"}],
+            "authorization": [{"type": "userlist", "userlist_allowed_users": []}],
+        }
+    }
     return UserAuthManager(config)
 
 
@@ -275,18 +335,17 @@ def server_for_test_app(test_app, host=None, port=None):
 
 @contextmanager
 def test_pulsar_server(global_conf={}, app_conf={}, test_conf={}):
-    with test_pulsar_app(global_conf, app_conf, test_conf) as app:
-        with server_for_test_app(app) as test_pulsar_server:
-            yield test_pulsar_server
+    with test_pulsar_app(global_conf, app_conf, test_conf) as app, server_for_test_app(app) as test_pulsar_server:
+        yield test_pulsar_server
 
 
-test_pulsar_server.__test__ = False  # type:ignore[attr-defined]
+test_pulsar_server.__test__ = False  # type: ignore[attr-defined]
 
 
 class RestartablePulsarAppProvider:
 
     def __init__(self, global_conf={}, app_conf={}, test_conf={}, web=True):
-        self.staging_directory = temp_directory_persist(prefix='staging_')
+        self.staging_directory = temp_directory_persist(prefix="staging_")
         self.global_conf = global_conf
         self.app_conf = app_conf
         self.test_conf = test_conf
@@ -295,11 +354,11 @@ class RestartablePulsarAppProvider:
     @contextmanager
     def new_app(self):
         with test_pulsar_app(
-                self.global_conf,
-                self.app_conf,
-                self.test_conf,
-                staging_directory=self.staging_directory,
-                web=self.web,
+            self.global_conf,
+            self.app_conf,
+            self.test_conf,
+            staging_directory=self.staging_directory,
+            web=self.web,
         ) as app:
             yield app
 
@@ -321,20 +380,20 @@ def restartable_pulsar_app_provider(**kwds):
 
 @contextmanager
 def test_pulsar_app(
-        global_conf={},
-        app_conf={},
-        test_conf={},
-        staging_directory=None,
-        web=True,
+    global_conf={},
+    app_conf={},
+    test_conf={},
+    staging_directory=None,
+    web=True,
 ):
     clean_staging_directory = False
     if staging_directory is None:
-        staging_directory = temp_directory_persist(prefix='staging_')
+        staging_directory = temp_directory_persist(prefix="staging_")
         clean_staging_directory = True
     # Make staging directory world executable for run as user tests.
     mode = stat(staging_directory).st_mode
     chmod(staging_directory, mode | S_IXGRP | S_IXOTH)
-    cache_directory = temp_directory_persist(prefix='cache_')
+    cache_directory = temp_directory_persist(prefix="cache_")
     app_conf["staging_directory"] = staging_directory
     app_conf["file_cache_dir"] = cache_directory
     app_conf["ensure_cleanup"] = True
@@ -351,12 +410,11 @@ def test_pulsar_app(
         for directory in to_clean:
             try:
                 rmtree(directory)
-                pass
             except Exception:
                 pass
 
 
-test_pulsar_app.__test__ = False  # type:ignore[attr-defined]
+test_pulsar_app.__test__ = False  # type: ignore[attr-defined]
 
 
 @contextmanager
@@ -366,11 +424,13 @@ def _yield_app(global_conf, app_conf, test_conf, web):
     try:
         if web:
             from pulsar.web.wsgi import app_factory
+
             app = app_factory(global_conf, **app_conf)
             yield TestApp(app, **test_conf)
         else:
-            from pulsar.main import load_app_configuration
             from pulsar.core import PulsarApp
+            from pulsar.main import load_app_configuration
+
             app_conf = load_app_configuration(local_conf=app_conf)
             app = PulsarApp(**app_conf)
             yield app
@@ -542,13 +602,13 @@ class EnvironmentVarGuard:
         return self
 
     def __exit__(self, *ignore_exc):
-        for (k, v) in self._changed.items():
+        for k, v in self._changed.items():
             if v is None:
                 if k in self._environ:
                     del self._environ[k]
             else:
                 self._environ[k] = v
-        os.environ = self._environ
+        os.environ = self._environ  # noqa: B003 - deliberately swapping the mapping, not updating it
 
 
 class IntegrationTestConfiguration:
@@ -570,8 +630,8 @@ class IntegrationTestConfiguration:
         try:
             # Let external users read/execute this directory for run as user
             # test.
-            system("chmod 755 %s" % self._tmp_path)
-            system("chmod -R 755 %s" % dependencies_dir)
+            subprocess.call(["chmod", "755", str(self._tmp_path)])
+            subprocess.call(["chmod", "-R", "755", str(dependencies_dir)])
         except Exception as e:
             print(e)
         env_file = dep1_directory / "env.sh"

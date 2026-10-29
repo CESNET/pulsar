@@ -1,18 +1,11 @@
 import ast
 import os
 import re
+import sys
 
-try:
-    from distutils.util import get_platform
-    is_windows = get_platform().startswith("win")
-except ImportError:
-    # Don't break install if distuils is incompatible in some way
-    # probably overly defensive.
-    is_windows = False
-try:
-    from setuptools import setup
-except ImportError:
-    from distutils.core import setup
+from setuptools import setup
+
+is_windows = sys.platform.startswith("win")
 
 # Set environment variable to 1 to build as library for Galaxy instead
 # of as stand-alone app.
@@ -23,7 +16,12 @@ readme = open('README.rst').read()
 history = open('HISTORY.rst').read().replace('.. :changelog:', '')
 
 if os.path.exists("requirements.txt"):
-    requirements = [r for r in open("requirements.txt").read().split("\n") if ";" not in r]
+    # PEP 508 environment markers (``foo; python_version >= "3.10"``) are
+    # passed through to setuptools verbatim. Vestigial pre-3.6 versions of
+    # this loop split ";"-bearing lines into a Python-2.7 sidecar list and
+    # then dropped them from ``requirements`` — which silently swallowed
+    # every modern marker-bearing dep.
+    requirements = open("requirements.txt").read().split("\n")
 else:
     # In tox, it will cover them anyway.
     requirements = []
@@ -71,9 +69,10 @@ setup(
         'pulsar.managers.util.condor',
         'pulsar.managers.util.drmaa',
         'pulsar.managers.util.job_script',
-        'pulsar.mesos',
         'pulsar.messaging',
         'pulsar.scripts',
+        'pulsar.testing',
+        'pulsar.testing.resilience',
         'pulsar.tools',
         'pulsar.user_auth',
         'pulsar.user_auth.methods',
@@ -91,6 +90,7 @@ setup(
         pulsar-submit=pulsar.scripts.submit:main
         pulsar-finish=pulsar.scripts.finish:main
         pulsar-run=pulsar.scripts.run:main
+        pulsar-serve=pulsar.scripts.serve:main
         _pulsar-conda-init=pulsar.scripts._conda_init:main
         _pulsar-configure-slurm=pulsar.scripts._configure_slurm:main
         _pulsar-configure-galaxy-cvmfs=pulsar.scripts._configure_galaxy_cvmfs:main
@@ -106,7 +106,8 @@ setup(
     install_requires=requirements,
     extras_require={
         'amqp': ['kombu'],
-        'web': ['Paste', 'PasteScript'],
+        'daemon': ['daemonize; sys_platform != "win32"'],
+        'web': ['gunicorn'],
         'galaxy_extended_metadata': ['galaxy-job-execution', 'galaxy-util[template]'],
     },
     license="Apache License 2.0",
@@ -120,11 +121,13 @@ setup(
         'Operating System :: Microsoft :: Windows',
         'Natural Language :: English',
         'Programming Language :: Python :: 3',
-        'Programming Language :: Python :: 3.6',
         'Programming Language :: Python :: 3.7',
         'Programming Language :: Python :: 3.8',
         'Programming Language :: Python :: 3.9',
         'Programming Language :: Python :: 3.10',
         'Programming Language :: Python :: 3.11',
+        'Programming Language :: Python :: 3.12',
+        'Programming Language :: Python :: 3.13',
+        'Programming Language :: Python :: 3.14',
     ],
 )

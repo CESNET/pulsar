@@ -8,6 +8,44 @@
 #  _default_:
 #    type: queued_python
 #    num_concurrent_jobs: 1
+#    min_polling_interval: 0.5
+#    ## Run jobs under cvmfsexec (https://github.com/cvmfs/cvmfsexec) so CVMFS
+#    ## repositories are available without a system-wide /cvmfs mount. This can
+#    ## also be set/overridden per-destination from Galaxy (a `cvmfsexec` job
+#    ## destination param with the same structure).
+#    #cvmfsexec:
+#    #  ## "namespace" (default requires unprivileged user namespaces; provides a
+#    #  ## real /cvmfs) or "mountrepo" (bind-mounts repos under
+#    #  ## <job_directory>/.cvmfsexec/dist/cvmfs for hosts without namespaces).
+#    #  mode: mountrepo
+#    #  ## Path to the cvmfsexec self-contained distribution to install into each
+#    #  ## job directory. See the "Containers" section of Pulsar's docs for how
+#    #  ## to build it: https://pulsar.readthedocs.io/en/latest/containers.html
+#    #  path: /path/to/cvmfsexec
+#    #  ## CVMFS repositories to mount for each job.
+#    #  repositories:
+#    #    - data.galaxyproject.org
+#    #    - singularity.galaxyproject.org
+#    ## In mountrepo mode the host-side container image path must be rewritten to
+#    ## the mounted location. This is necessary and is configured on the Galaxy
+#    ## job destination (not here) with a file_actions rewrite rule; see the
+#    ## example in the "Galaxy Configuration" section of Pulsar's docs:
+#    ## https://pulsar.readthedocs.io/en/latest/galaxy_conf.html
+
+    ## Shell injected immediately before / after the main job command in the
+    ## generated job script (runs on the compute node, in the job's working
+    ## directory). Accepts a single (multi-line) string or a YAML list with one
+    ## command per line; to run a script use `source /path/pre.sh` or a path to
+    ## an executable. These merge with - never replace - any job metrics
+    ## instrumentation (see job_metrics_config.yml), so both your commands and
+    ## the metrics collectors run. Setting these at the top level of this file
+    ## (or via PULSAR_CONFIG_JOB_PRE_COMMANDS / PULSAR_CONFIG_JOB_POST_COMMANDS
+    ## exported in local_env.sh) makes them the default for every manager,
+    ## overridable per manager here.
+    #job_pre_commands:
+    #  - "source /opt/cesnet/env/pre.sh"
+    #  - "echo starting on $(hostname)"
+    #job_post_commands: "echo finished; /opt/cesnet/env/cleanup.sh"
 
 
 ## Mode to create job releated directories with. If unset
@@ -86,6 +124,15 @@
 ## Alternatively, use pulsar-relay (experimental) with HTTP/HTTPS instead of AMQP.
 ## This does not require kombu or RabbitMQ.
 #message_queue_url: https://relay-server.example.org:9000
+##
+## Recommended: bootstrap a refresh token via OIDC sign-in once with
+##   pulsar-config --login --relay-url https://relay-server.example.org:9000 --directory .
+## then point this config key at the resulting credentials file. The daemon
+## will rotate the refresh token automatically; no shared password to manage.
+#message_queue_credentials_file: ./relay_credentials.json
+##
+## Legacy: pre-shared username/password. Still supported for backwards
+## compatibility, but new deployments should prefer the credentials file above.
 #message_queue_username: admin
 #message_queue_password: changeme
 
@@ -94,6 +141,15 @@
 ## prefixes (e.g., "production", "staging"). Must match the relay_topic_prefix
 ## configured in Galaxy's job_conf.yml if set.
 #relay_topic_prefix: production
+
+## On startup, publish a static capability snapshot (staging dirs, dependency
+## resolvers, container runtimes available, manager type) to the relay topic
+## "pulsar_capabilities[_<manager>]". Galaxy can read this to auto-fill
+## destination params and to refuse jobs that ask for capabilities this Pulsar
+## doesn't have. Advisory: a publish failure does not block startup, and
+## Galaxy keeps using operator-supplied params if no snapshot is available.
+## Set to false to disable the publish entirely.
+#message_queue_publish_capabilities: true
 
 ## Pulsar loops over waiting for queue messages for a short time before checking
 ## to see if it has been instructed to shut down. By default this is 0.2
@@ -104,6 +160,12 @@
 ## publishing messages to the queue may hang if the connection becomes invalid.
 ## this value is used as the timeout argument to the producer.publish function.
 #amqp_publish_timeout: 2.0
+
+## Interval in seconds at which Pulsar requests AMQP heartbeats on its consumer
+## connections (see: https://www.rabbitmq.com/docs/heartbeats). The broker may
+## negotiate a shorter interval - RabbitMQ proposes 60 by default, and the lower
+## of the two wins. Set to false or 0 to disable heartbeats entirely.
+#amqp_heartbeat: 580
 
 # AMQP does not guarantee that a published message is received by the AMQP
 # server, so Pulsar can request that the consumer acknowledge messages and will
@@ -169,3 +231,35 @@
 ## Determines the minimum log level that will be sent as an event to
 ## Sentry. Possible values are DEBUG, INFO, WARNING, ERROR or CRITICAL.
 ##sentry_event_level: WARNING
+
+## Maximum bytes of each tool and job stdout/stderr stream read when a job
+## completes. A longer stream keeps its start and end, joined by "..", since
+## the end is usually where a failing tool says why. The completion status
+## sent to Galaxy is further capped at 64 KiB per tool stream the same way.
+#maximum_stream_size: 1048576
+
+## Stream tool stdout/stderr to Galaxy while the job is still running, so
+## Galaxy can display live tool output instead of only showing it once the
+## job completes. Off by default. Galaxy must also enable the feature on the
+## job destination (`live_tool_output_reporting: true` in its job config) for
+## the output to be shown in the UI.
+#send_stdout_update: false
+
+## Live updates for all running jobs are sent by a single background thread,
+## one request at a time, and never query the batch system. Each stream sends
+## at most maximum_stream_size bytes in total, like the completion status.
+## Jobs whose Galaxy destination does not use remote transfer (no files
+## endpoint) are skipped.
+
+## Seconds between live stdout/stderr updates when send_stdout_update is
+## enabled. Each update posts only the bytes written since the last one.
+#stdout_update_interval: 3.0
+
+## Seconds before a live update request to Galaxy is abandoned. Failed
+## requests pause updates to that Galaxy with exponential backoff (up to 5
+## minutes), and the streams then travel with the completion status instead.
+#stdout_update_timeout: 30.0
+
+## Maximum bytes of one stream sent in a single live update request. A job
+## with more pending output catches up over consecutive requests.
+#stdout_update_chunk_size: 524288

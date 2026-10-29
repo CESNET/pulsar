@@ -2,8 +2,8 @@ from typing import (
     Any,
     Dict,
     Optional,
+    TYPE_CHECKING,
 )
-
 
 IMPORT_MESSAGE = None
 try:
@@ -15,11 +15,12 @@ try:
         TesTask,
     )
 except ImportError as exc:
-    TesClient = None  # type: ignore
-    TesExecutor = None  # type: ignore
-    TesResources = None  # type: ignore
-    TesState = None  # type: ignore
-    TesTask = None  # type: ignore
+    if not TYPE_CHECKING:
+        TesClient = None
+        TesExecutor = None
+        TesResources = None
+        TesState = None
+        TesTask = None
     IMPORT_MESSAGE = (
         "The Python pydantic-tes package is required to use "
         "this feature, please install it or correct the "
@@ -34,14 +35,16 @@ def ensure_tes_client() -> None:
 
 
 def tes_galaxy_instance_id(destination_params: Dict[str, Any]) -> Optional[str]:
-    return destination_params.get("galaxy_instance_id") or destination_params.get("tes_galaxy_instance_id")
+    return destination_params.get("galaxy_instance_id") or destination_params.get(
+        "tes_galaxy_instance_id"
+    )
 
 
 __all__ = (
-    "ensure_tes_client",
     "TesClient",
     "TesExecutor",
     "TesResources",
     "TesState",
     "TesTask",
+    "ensure_tes_client",
 )

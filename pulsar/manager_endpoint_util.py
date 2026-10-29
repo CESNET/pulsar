@@ -4,6 +4,7 @@ and message queue.
 
 import logging
 import os
+from io import BytesIO
 
 from galaxy.util import unicodify
 
@@ -13,9 +14,17 @@ from pulsar.managers import (
     PULSAR_UNKNOWN_RETURN_CODE,
     status,
 )
+from pulsar.managers.base import shrink_stream
 from pulsar.managers.staging import realized_dynamic_file_sources
+from pulsar.managers.stateful import ACTIVE_STATUS_PREPROCESSING
 
 log = logging.getLogger(__name__)
+
+# Substituted until 0.15.16. A destination still configured with it would
+# otherwise stage into a directory literally named for the token.
+REMOVED_JOBS_DIRECTORY_TOKEN = '__PULSAR_JOBS_DIRECTORY__'
+
+MAXIMUM_STATUS_STREAM_SIZE = 64 * 1024
 
 
 def status_dict(manager, job_id):
@@ -25,7 +34,20 @@ def status_dict(manager, job_id):
 
 def full_status(manager, job_status, job_id):
     if status.is_job_done(job_status):
-        full_status = __job_complete_dict(job_status, manager, job_id)
+        try:
+            full_status = __job_complete_dict(job_status, manager, job_id)
+        except Exception:
+            if job_status == status.COMPLETE:
+                raise
+            # A job that failed before launch may not have a readable job
+            # directory - still report the failure.
+            log.exception("Failed to collect final status details for job %s, reporting status only", job_id)
+            return {"job_id": job_id, "complete": "true", "status": job_status, "returncode": None}
+        if manager.is_live_stdout_update(job_id):
+            # Streams were already delivered live; don't send them twice.
+            full_status["stdout"] = None
+            full_status["stderr"] = None
+
     else:
         full_status = {"complete": "false", "status": job_status, "job_id": job_id}
     return full_status
@@ -38,31 +60,31 @@ def __job_complete_dict(complete_status, manager, job_id):
     return_code = manager.return_code(job_id)
     if return_code == PULSAR_UNKNOWN_RETURN_CODE:
         return_code = None
-    stdout_contents = unicodify(manager.stdout_contents(job_id))
-    stderr_contents = unicodify(manager.stderr_contents(job_id))
+    stdout_contents = unicodify(shrink_stream(BytesIO(manager.stdout_contents(job_id)), MAXIMUM_STATUS_STREAM_SIZE))
+    stderr_contents = unicodify(shrink_stream(BytesIO(manager.stderr_contents(job_id)), MAXIMUM_STATUS_STREAM_SIZE))
     job_stdout_contents = unicodify(manager.job_stdout_contents(job_id).decode("utf-8"))
     job_stderr_contents = unicodify(manager.job_stderr_contents(job_id).decode("utf-8"))
     job_directory = manager.job_directory(job_id)
-    as_dict = dict(
-        job_id=job_id,
-        complete="true",  # Is this still used or is it legacy.
-        status=complete_status,
-        returncode=return_code,
-        stdout=stdout_contents,
-        stderr=stderr_contents,
-        job_stdout=job_stdout_contents,
-        job_stderr=job_stderr_contents,
-        working_directory=job_directory.working_directory(),
-        metadata_directory=job_directory.metadata_directory(),
-        job_directory=job_directory.job_directory,
-        working_directory_contents=job_directory.working_directory_contents(),
-        metadata_directory_contents=job_directory.metadata_directory_contents(),
-        outputs_directory_contents=job_directory.outputs_directory_contents(),
-        job_directory_contents=job_directory.job_directory_contents(),
-        system_properties=manager.system_properties(),
-        pulsar_version=pulsar_version,
-        realized_dynamic_file_sources=realized_dynamic_file_sources(job_directory)
-    )
+    as_dict = {
+        "job_id": job_id,
+        "complete": "true",  # Is this still used or is it legacy.
+        "status": complete_status,
+        "returncode": return_code,
+        "stdout": stdout_contents,
+        "stderr": stderr_contents,
+        "job_stdout": job_stdout_contents,
+        "job_stderr": job_stderr_contents,
+        "working_directory": job_directory.working_directory(),
+        "metadata_directory": job_directory.metadata_directory(),
+        "job_directory": job_directory.job_directory,
+        "working_directory_contents": job_directory.working_directory_contents(),
+        "metadata_directory_contents": job_directory.metadata_directory_contents(),
+        "outputs_directory_contents": job_directory.outputs_directory_contents(),
+        "job_directory_contents": job_directory.job_directory_contents(),
+        "system_properties": manager.system_properties(),
+        "pulsar_version": pulsar_version,
+        "realized_dynamic_file_sources": realized_dynamic_file_sources(job_directory)
+    }
     return as_dict
 
 
@@ -72,6 +94,13 @@ def submit_job(manager, job_config):
     """
     # job_config is raw dictionary from JSON (from MQ or HTTP endpoint).
     job_id = job_config.get('job_id')
+    if job_id and _is_duplicate_setup(manager, job_id):
+        log.info(
+            "Ignoring duplicate setup message for job_id %s (launch_config already "
+            "persisted; this is most likely an MQ redelivery after Pulsar restart).",
+            job_id,
+        )
+        return
     try:
         command_line = job_config.get('command_line')
 
@@ -84,6 +113,7 @@ def submit_job(manager, job_config):
         touch_outputs = job_config.get('touch_outputs', [])
         dynamic_file_sources = job_config.get("dynamic_file_sources", None)
         token_endpoint = job_config.get("token_endpoint", None)
+        cvmfsexec = job_config.get("cvmfsexec", None)
 
         job_config = None
         if setup_params or force_setup:
@@ -98,11 +128,32 @@ def submit_job(manager, job_config):
             )
 
         if job_config is not None:
-            job_directory = job_config["job_directory"]
-            jobs_directory = os.path.abspath(os.path.join(job_directory, os.pardir))
-            command_line = command_line.replace('__PULSAR_JOBS_DIRECTORY__', jobs_directory)
+            job_directory = os.path.abspath(job_config["job_directory"])
+            # The absolute per-job directory. Lets the client emit a path that is
+            # relative to the (runtime-unknown) job directory without embedding a
+            # shell variable - important for tokens that pass through shlex.quote
+            # on the client (e.g. a container image path rewritten for cvmfsexec).
+            #
+            # Command line only. The token is resolved here, after staging has
+            # been described but before it runs, so it cannot reach config or
+            # metadata file *contents*; a rewrite rule that puts it there leaves
+            # it unresolved. Rules are restricted to path_types: container,
+            # which only ever reaches the command line.
+            command_line = command_line.replace('__PULSAR_JOB_DIRECTORY__', job_directory)
 
-        # TODO: Handle __PULSAR_JOB_DIRECTORY__ config files, metadata files, etc...
+            if REMOVED_JOBS_DIRECTORY_TOKEN in command_line:
+                raise Exception(
+                    "This destination's command line contains %s, which Pulsar no "
+                    "longer substitutes. Set jobs_directory to the staging path "
+                    "configured on this Pulsar server instead." % REMOVED_JOBS_DIRECTORY_TOKEN
+                )
+
+        # Deliver a per-job cvmfsexec override to the manager via setup_params.
+        # Merged here (after the setup decision above) so it does not itself
+        # trigger job setup.
+        if cvmfsexec is not None:
+            setup_params = {**setup_params, "cvmfsexec": cvmfsexec}
+
         manager.touch_outputs(job_id, touch_outputs)
         launch_config = {
             "remote_staging": remote_staging,
@@ -132,3 +183,40 @@ def setup_job(manager, job_id, tool_id, tool_version):
         tool_id=tool_id,
         tool_version=tool_version
     )
+
+
+def _is_duplicate_setup(manager, job_id: str) -> bool:
+    """Detect a redelivered setup message for a job that has already been launched.
+
+    Setup messages can be redelivered when Pulsar restarts after acking an AMQP
+    setup but before the broker recorded the ack, or any time the consumer
+    crashes mid-processing.
+
+    We only short-circuit when the job is in a state recovery can finish on
+    its own — i.e. either the job has reached a terminal status, or it is
+    still tracked by ``active_jobs`` and ``recover_active_jobs`` will resume
+    it. If the prior run crashed *between* persisting ``launch_config`` and
+    activating the job there is no recovery hook, so we let the redelivered
+    message drive a fresh ``preprocess_and_launch``.
+    """
+    try:
+        job_directory = manager.job_directory(job_id)
+    except (TypeError, ValueError, OSError):
+        # Malformed job_id from a redelivered or corrupt message body.
+        return False
+    if not job_directory.exists():
+        return False
+    if job_directory.has_metadata("final_status"):
+        return True
+    active_jobs = manager.active_jobs
+    try:
+        if job_id in set(active_jobs.active_job_ids()):
+            return True
+        if job_id in set(active_jobs.active_job_ids(active_status=ACTIVE_STATUS_PREPROCESSING)):
+            return True
+    except OSError:
+        # active_job_ids() reads filesystem state; if the persistence
+        # directory is unreadable we can't tell if it's a duplicate, so
+        # let preprocess_and_launch run again.
+        pass
+    return False

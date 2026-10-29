@@ -19,16 +19,14 @@ from typing import (
     TYPE_CHECKING,
 )
 
+from . import COMMAND_VERSION_FILENAME
+from .inputs import CLIENT_INPUT_PATH_TYPES
 from ..action_mapper import (
     FileActionMapper,
     MessageAction,
     path_type,
 )
 from ..job_directory import RemoteJobDirectory
-from ..staging import (
-    CLIENT_INPUT_PATH_TYPES,
-    COMMAND_VERSION_FILENAME,
-)
 from ..util import (
     directory_files,
     ExternalId,
@@ -36,7 +34,7 @@ from ..util import (
 )
 
 if TYPE_CHECKING:
-    from pulsar.client.staging import ClientJobDescription
+    from .models import ClientJobDescription
 
 log = getLogger(__name__)
 
@@ -45,11 +43,11 @@ def submit_job(client, client_job_description: "ClientJobDescription", job_confi
     file_stager = FileStager(client, client_job_description, job_config)
     rebuilt_command_line = file_stager.get_command_line()
     job_id = file_stager.job_id
-    launch_kwds = dict(
-        command_line=rebuilt_command_line,
-        dependencies_description=client_job_description.dependencies_description,
-        env=client_job_description.env,
-    )
+    launch_kwds = {
+        "command_line": rebuilt_command_line,
+        "dependencies_description": client_job_description.dependencies_description,
+        "env": client_job_description.env,
+    }
     container_info = None
     if client_job_description.container:
         container_info = {
@@ -226,7 +224,7 @@ class FileStager:
                     self.referenced_tool_files.append((local_file, relpath(local_file, self.tool_dir)))
 
     def __initialize_referenced_arbitrary_files(self):
-        referenced_arbitrary_path_mappers = dict()
+        referenced_arbitrary_path_mappers = {}
         for mapper in self.action_mapper.unstructured_mappers():
             mapper_pattern = mapper.to_pattern()
             # TODO: Make more sophisticated, allow parent directories,
@@ -433,7 +431,7 @@ class JobInputs:
         if directory is None:
             return []
 
-        pattern = r'''[\'\"]?({}{}[^\s\'\"]+)[\'\"]?'''.format(escape(directory), escape(sep))
+        pattern = rf'''[\'\"]?({escape(directory)}{escape(sep)}[^\s\'\"]+)[\'\"]?'''
         return self.find_pattern_references(pattern)
 
     def path_referenced(self, path):
@@ -561,11 +559,11 @@ class TransferTracker:
         # else: # No action for this file
 
     def __add_remote_staging_input(self, action, name, type):
-        input_dict = dict(
-            name=name,
-            type=type,
-            action=action.to_dict(),
-        )
+        input_dict = {
+            "name": name,
+            "type": type,
+            "action": action.to_dict(),
+        }
         self.remote_staging_actions.append(input_dict)
 
     def __action_for_transfer(self, source, type, contents):
@@ -577,7 +575,7 @@ class TransferTracker:
             path = source.get("path")
             if path is not None and not exists(path):
                 message = "__action_for_transfer called on non-existent file - [%s]" % path
-                log.warn(message)
+                log.warning(message)
                 raise Exception(message)
             action = self.__action(source, type)
         return action

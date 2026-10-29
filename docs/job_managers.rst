@@ -11,7 +11,7 @@ qsub/qstat CLI commands, or Condor_).
 
 To configure job managers, uncomment the ``managers`` section of ``app.yml``
 and modify it as needed. For instance, the default job manager corresponds to
-a configuration of 
+a configuration of
 
 .. code-block:: YAML
 
@@ -113,7 +113,7 @@ Pulsar can manage jobs via command-line execution of ``qsub``, ``qdel``,
         job_plugin: Torque
 
 ``job_plugin`` can also be ``Slurm`` (to use ``srun``, etc...) or
-``SlurmTorque`` (to use the Slurm varaint of ``qsub``, etc...).
+``SlurmTorque`` (to use the Slurm variant of ``qsub``, etc...).
 
 Pulsar can also login into a remote host before executing these commands if
 the job manager is not accessible from the Pulsar host.
@@ -150,10 +150,26 @@ run DRMAA jobs via the user requested by the client (e.g. the Galaxy user).
         #chown_working_directory_script: scripts/chown_working_directory.bash
         #drmaa_kill_script: scripts/drmaa_kill.bash
         #drmaa_launch_script: scripts/drmaa_launch.bash
+        #user_mapping_script:
+        #user_mapping_timeout: 30
 
-For more information on running jobs as the real user, check out `this discussion
-<http://dev.list.galaxyproject.org/Managing-Data-Locality-tp4662438.html>`__ from
-the Galaxy mailing list.
+Additionally, set ``submit_user`` to ``$__user_name__`` in Galaxy's Pulsar job
+destination. See Galaxy's `sample job configuration
+<https://github.com/galaxyproject/galaxy/blob/dev/lib/galaxy/config/sample/job_conf.sample.yml>`__.
+
+
+A script that maps the user name Pulsar receives from the Galaxy server onto a user
+name on the target system can be configured with the optional parameter
+``user_mapping_script``. The script receives the client-supplied name as a single
+positional argument and should print the mapped name to stdout. If a mapping is not
+possible it should exit with a non-zero status and print an error message to stderr,
+which Pulsar logs.
+
+The mapped name is passed to ``sudo -u`` and to the working-directory chown, so it is
+validated before use: it must match ``[A-Za-z0-9._][A-Za-z0-9._-]*``. A script that
+exits successfully but prints nothing, or prints a name outside that set, fails the
+job rather than falling through to an unintended account. The script must return within
+``user_mapping_timeout`` seconds (default 30).
 
 More Options
 -------------------------------
@@ -178,6 +194,45 @@ this may be a bit counter-intuitive but is consistent with Kombu_.
     postprocess_action_interval_step: 2
     postprocess_action_interval_max: 30
 
+Pre and Post Job Commands
+-------------------------------
+
+Any manager that renders a job script (``queued_drmaa``, ``queued_cli``,
+``queued_condor``, ``queued_pbs``, ``queued_python``, and the message-queue
+managers) accepts ``job_pre_commands`` and ``job_post_commands``.
+These are shell fragments injected into the generated job script immediately
+before and immediately after the tool's main command, so they run on the compute
+node inside the job's working directory and shell environment.
+
+Each option accepts either a single (possibly multi-line) string or a YAML list
+with one command per line:
+
+.. code-block:: YAML
+
+    managers:
+      _default_:
+        type: queued_drmaa
+        job_pre_commands:
+          - "source /opt/cesnet/env/pre.sh"
+          - "echo starting on $(hostname)"
+        job_post_commands: "echo finished; /opt/cesnet/env/cleanup.sh"
+
+To run a script, reference it as a command (``source /path/pre.sh`` or the path
+to an executable).
+
+These commands **merge with** - and never replace - the commands written by job
+metrics instrumentation (``job_metrics_config.yml``). Your pre-commands run
+before the instrumentation's, and your post-commands run after, so your setup
+and teardown bracket the whole instrumented job and metrics collection is
+preserved.
+
+The options can be set per manager (as above) or once at the top level of
+``app.yml`` to apply to every manager, with any manager overriding the global
+value. They can also be supplied through the environment - e.g. exported in
+``local_env.sh`` - using the ``PULSAR_CONFIG_JOB_PRE_COMMANDS`` /
+``PULSAR_CONFIG_JOB_POST_COMMANDS`` variables, which act as a default for any
+manager that does not set its own. The legacy names ``instrument_pre_commands``
+and ``instrument_post_commands`` are accepted as aliases for both options.
 
 .. _DRMAA: http://www.drmaa.org/
 .. _Condor: http://research.cs.wisc.edu/htcondor/

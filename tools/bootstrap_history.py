@@ -3,25 +3,28 @@
 # pull message down and embed, use arg parse, handle multiple, etc...
 import os
 import sys
+
 try:
     import requests
 except ImportError:
     requests = None
-import urllib.parse
+import re
 import textwrap
+import urllib.parse
 
 PROJECT_DIRECTORY = os.path.join(os.path.dirname(__file__), "..")
 new_path = [PROJECT_DIRECTORY]
 new_path.extend( sys.path[1:] )  # remove scripts/ from the path
 sys.path = new_path
 
-import pulsar as project
+import pulsar as project  # noqa: E402 - must follow the sys.path rewrite above
 
 PROJECT_OWNER = project.PROJECT_OWNER
 PROJECT_NAME = project.PROJECT_NAME
-PROJECT_URL = "https://github.com/{}/{}".format(PROJECT_OWNER, PROJECT_NAME)
-PROJECT_API = "https://api.github.com/repos/{}/{}/".format(PROJECT_OWNER, PROJECT_NAME)
+PROJECT_URL = f"https://github.com/{PROJECT_OWNER}/{PROJECT_NAME}"
+PROJECT_API = f"https://api.github.com/repos/{PROJECT_OWNER}/{PROJECT_NAME}/"
 AUTHORS_SKIP_CREDIT = ["jmchilton"]
+TOP_SECTION_HEADER = re.compile(r"^\.\. to_doc\n\s*-+\n[^\n]+\n-+\n", re.MULTILINE)
 
 
 def main(argv):
@@ -37,7 +40,7 @@ def main(argv):
     message = ""
     if len(argv) > 2:
         message = argv[2]
-    elif not (ident.startswith("pr") or ident.startswith("issue")):
+    elif not (ident.startswith(("pr", "issue"))):
         api_url = urllib.parse.urljoin(PROJECT_API, "commits/%s" % ident)
         req = requests.get(api_url).json()
         commit = req["commit"]
@@ -51,7 +54,9 @@ def main(argv):
         login = req["user"]["login"]
         if login not in AUTHORS_SKIP_CREDIT:
             message = message.rstrip(".")
-            message += " (thanks to `@%s`_)." % req["user"]["login"]
+            message += " (thanks to `@%s`_)." % login
+            if f".. _@{login}:" not in history:
+                history = history.rstrip("\n") + f"\n.. _@{login}: https://github.com/{login}\n"
     elif requests is not None and ident.startswith("issue"):
         issue = ident[len("issue"):]
         api_url = urllib.parse.urljoin(PROJECT_API, "issues/%s" % issue)
@@ -64,23 +69,30 @@ def main(argv):
 
     if ident.startswith("pr"):
         pull_request = ident[len("pr"):]
-        text = ".. _Pull Request {0}: {1}/pull/{0}".format(pull_request, PROJECT_URL)
+        text = f".. _Pull Request {pull_request}: {PROJECT_URL}/pull/{pull_request}"
         history = extend(".. github_links", text)
-        to_doc += "`Pull Request {}`_".format(pull_request)
+        to_doc += f"`Pull Request {pull_request}`_"
     elif ident.startswith("issue"):
         issue = ident[len("issue"):]
-        text = ".. _Issue {0}: {1}/issues/{0}".format(issue, PROJECT_URL)
+        text = f".. _Issue {issue}: {PROJECT_URL}/issues/{issue}"
         history = extend(".. github_links", text)
-        to_doc += "`Issue {}`_".format(issue)
+        to_doc += f"`Issue {issue}`_"
     else:
         short_rev = ident[:7]
-        text = ".. _{0}: {1}/commit/{0}".format(short_rev, PROJECT_URL)
+        text = f".. _{short_rev}: {PROJECT_URL}/commit/{short_rev}"
         history = extend(".. github_links", text)
-        to_doc += "{}_".format(short_rev)
+        to_doc += f"{short_rev}_"
 
-    to_doc = wrap(to_doc)
-    history = extend(".. to_doc", to_doc)
+    history = add_entry(history, wrap(to_doc))
     open(history_path, "w", encoding="utf-8").write(history)
+
+
+def add_entry(history, entry):
+    """Add ``entry`` to the top of the newest (``.dev0``) section."""
+    header = TOP_SECTION_HEADER.search(history)
+    if header is None:
+        raise Exception("No version section found under '.. to_doc'")
+    return history[:header.end()] + entry + "\n" + history[header.end():]
 
 
 def get_first_sentence(message):

@@ -2,11 +2,17 @@
 Base Classes and Infrastructure Supporting Concret Manager Implementations.
 
 """
+
 import errno
 import json
 import logging
 import os
 import platform
+import threading
+from abc import (
+    ABC,
+    abstractmethod,
+)
 from os import (
     curdir,
     getenv,
@@ -23,7 +29,21 @@ from os.path import (
     relpath,
 )
 from shutil import rmtree
+from typing import (
+    Any,
+    Dict,
+    IO,
+    List,
+    Optional,
+    TYPE_CHECKING,
+    Union,
+)
 from uuid import uuid4
+
+from galaxy.util import (
+    shrink_stream_by_size,
+    smart_str,
+)
 
 from pulsar import locks
 from pulsar.client.job_directory import (
@@ -31,6 +51,17 @@ from pulsar.client.job_directory import (
     RemoteJobDirectory,
 )
 from pulsar.managers import ManagerInterface
+from pulsar.managers.util.cvmfsexec import parse as parse_cvmfsexec_config
+from pulsar.managers.util.env import EnvVar
+
+if TYPE_CHECKING:
+    from threading import Lock
+
+    from galaxy.tool_util.deps.dependencies import DependenciesDescription
+    from lockfile import LockFile
+
+    from pulsar.core import PulsarApp
+    from pulsar.tools.authorization import ToolBasedAuthorization
 
 JOB_DIRECTORY_INPUTS = "inputs"
 JOB_DIRECTORY_OUTPUTS = "outputs"
@@ -44,13 +75,22 @@ DEFAULT_ID_ASSIGNER = "galaxy"
 ID_ASSIGNER = {
     # Generate a random id, needed if multiple
     # Galaxy instances submitting to same Pulsar.
-    'uuid': lambda galaxy_job_id: uuid4().hex,
+    "uuid": lambda galaxy_job_id: uuid4().hex,
     # Pass galaxy id through, default for single
     # Galaxy Pulsar instance.
-    'galaxy': lambda galaxy_job_id: galaxy_job_id
+    "galaxy": lambda galaxy_job_id: galaxy_job_id,
 }
 
 log = logging.getLogger(__name__)
+
+# Same shape as Galaxy's own trimming of job streams (galaxy.util.shrink_and_unicodify).
+STREAM_SHRINK_KWDS: Dict[str, Any] = {"join_by": "\n..\n", "left_larger": True, "beginning_on_size_error": True}
+
+
+def shrink_stream(stream: IO[bytes], size: int) -> bytes:
+    """Read a binary stream, shrunk to ``size`` bytes keeping its start and end."""
+    # Returns text, or raw bytes when size is too small to join start and end.
+    return smart_str(shrink_stream_by_size(stream, size, **STREAM_SHRINK_KWDS))
 
 
 def get_id_assigner(assign_ids):
@@ -58,19 +98,48 @@ def get_id_assigner(assign_ids):
     return ID_ASSIGNER.get(assign_ids, default_id_assigner)
 
 
-class BaseManager(ManagerInterface):
+def normalize_commands(value) -> str:
+    """Render a configured command value into shell for the job script.
 
-    def __init__(self, name, app, **kwds):
+    Accepts a YAML list (one command per line) or a single (possibly
+    multi-line) string, and returns newline-joined shell. Empty/None becomes
+    an empty string so callers can test the result directly.
+    """
+    if not value:
+        return ""
+    if isinstance(value, (list, tuple)):
+        return "\n".join(str(line) for line in value if str(line).strip())
+    return str(value)
+
+
+class BaseManager(ManagerInterface, ABC):
+
+    def __init__(self, name: str, app: "PulsarApp", **kwds):
         self.name = name
-        self.persistence_directory = getattr(app, 'persistence_directory', None)
+        self.persistence_directory = getattr(app, "persistence_directory", None)
         self.lock_manager = locks.LockManager()
-        self._directory_maker = DirectoryMaker(kwds.get("job_directory_mode", None))
+        self._directory_maker = DirectoryMaker(kwds.get("job_directory_mode"))
         staging_directory = kwds.get("staging_directory", app.staging_directory)
         self._setup_staging_directory(staging_directory)
-        self.id_assigner = get_id_assigner(kwds.get("assign_ids", None))
-        self.maximum_stream_size = kwds.get("maximum_stream_size", -1)
+        self.id_assigner = get_id_assigner(kwds.get("assign_ids"))
+        self.maximum_stream_size = int(kwds.get("maximum_stream_size", -1))
         self.__init_galaxy_system_properties(kwds)
-        self.tmp_dir = kwds.get("tmp_dir", None)
+        self.tmp_dir: Optional[str] = kwds.get("tmp_dir")
+        # Default cvmfsexec configuration for this manager (app.yml). May be
+        # overridden per job by a ``cvmfsexec`` entry in setup_params.
+        self.cvmfsexec_config = parse_cvmfsexec_config(kwds.get("cvmfsexec"))
+        # Shell injected immediately before/after the main job command in the
+        # generated job script. Configurable per manager in app.yml (with the
+        # legacy ``instrument_*`` names accepted as aliases); a top-level app.yml
+        # value or a PULSAR_CONFIG_* env var (e.g. from local_env.sh) acts as the
+        # global default via manager_factory. Merged with the job-instrumenter's
+        # own commands (see job_script) so job metrics are preserved.
+        self.job_pre_commands = normalize_commands(
+            kwds.get("job_pre_commands") or kwds.get("instrument_pre_commands")
+        )
+        self.job_post_commands = normalize_commands(
+            kwds.get("job_post_commands") or kwds.get("instrument_post_commands")
+        )
         self.debug = str(kwds.get("debug", False)).lower() == "true"
         self.authorizer = app.authorizer
         self.user_auth_manager = app.user_auth_manager
@@ -84,7 +153,7 @@ class BaseManager(ManagerInterface):
     def _is_windows(self) -> bool:
         return platform.system().lower() == "windows"
 
-    def clean(self, job_id):
+    def clean(self, job_id: str) -> None:
         if self.debug:
             # In debug mode skip cleaning job directories.
             return
@@ -96,18 +165,21 @@ class BaseManager(ManagerInterface):
             except Exception:
                 pass
 
-    def system_properties(self):
+    def system_properties(self) -> Dict[str, Any]:
         return self.__system_properties
 
+    # TODO
     def __init_galaxy_system_properties(self, kwds):
-        self.galaxy_home = kwds.get('galaxy_home', None)
-        self.galaxy_virtual_env = kwds.get('galaxy_virtual_env', None)
-        self.galaxy_config_file = kwds.get('galaxy_config_file', None)
-        self.galaxy_dataset_files_path = kwds.get('galaxy_dataset_files_path', None)
-        self.galaxy_datatypes_config_file = kwds.get('galaxy_datatypes_config_file', None)
+        self.galaxy_home = kwds.get("galaxy_home", None)
+        self.galaxy_virtual_env = kwds.get("galaxy_virtual_env", None)
+        self.galaxy_config_file = kwds.get("galaxy_config_file", None)
+        self.galaxy_dataset_files_path = kwds.get("galaxy_dataset_files_path", None)
+        self.galaxy_datatypes_config_file = kwds.get(
+            "galaxy_datatypes_config_file", None
+        )
 
-    def __init_system_properties(self):
-        system_properties = {
+    def __init_system_properties(self) -> None:
+        system_properties: Dict[str, Any] = {
             "separator": sep,
         }
         galaxy_home = self._galaxy_home()
@@ -116,42 +188,46 @@ class BaseManager(ManagerInterface):
         galaxy_virtual_env = self._galaxy_virtual_env()
         if galaxy_virtual_env:
             system_properties["galaxy_virtual_env"] = galaxy_virtual_env
-        for property in ['galaxy_config_file', 'galaxy_dataset_files_path', 'galaxy_datatypes_config_file']:
+        for property in [
+            "galaxy_config_file",
+            "galaxy_dataset_files_path",
+            "galaxy_datatypes_config_file",
+        ]:
             value = getattr(self, property, None)
             if value:
                 system_properties[property] = value
 
         self.__system_properties = system_properties
 
-    def __init_env_vars(self, **kwds):
-        env_vars = []
+    def __init_env_vars(self, **kwds: Any) -> None:
+        env_vars: List[EnvVar] = []
         for key, value in kwds.items():
             if key.lower().startswith("env_"):
-                name = key[len("env_"):]
-                env_vars.append(dict(name=name, value=value, raw=False))
+                name = key[len("env_") :]
+                env_vars.append({"name": name, "value": value, "raw": False})
         self.env_vars = env_vars
 
-    def _galaxy_home(self):
-        return self.galaxy_home or getenv('GALAXY_HOME', None)
+    def _galaxy_home(self) -> Optional[str]:
+        return self.galaxy_home or getenv("GALAXY_HOME", None)
 
-    def _galaxy_virtual_env(self):
-        return self.galaxy_virtual_env or getenv('GALAXY_VIRTUAL_ENV', None)
+    def _galaxy_virtual_env(self) -> Optional[str]:
+        return self.galaxy_virtual_env or getenv("GALAXY_VIRTUAL_ENV", None)
 
-    def _galaxy_lib(self):
+    def _galaxy_lib(self) -> Optional[str]:
         galaxy_home = self._galaxy_home()
         galaxy_lib = None
-        if galaxy_home and str(galaxy_home).lower() != 'none':
-            galaxy_lib = join(galaxy_home, 'lib')
+        if galaxy_home and galaxy_home.lower() != "none":
+            galaxy_lib = join(galaxy_home, "lib")
         return galaxy_lib
 
-    def _setup_staging_directory(self, staging_directory):
+    def _setup_staging_directory(self, staging_directory: Optional[str]):
         assert staging_directory is not None
         if not exists(staging_directory):
             self._directory_maker.make(staging_directory, recursive=True)
         assert isdir(staging_directory)
         self.staging_directory = staging_directory
 
-    def _job_directory(self, job_id):
+    def _job_directory(self, job_id: str) -> "JobDirectory":
         return JobDirectory(
             self.staging_directory,
             job_id,
@@ -161,23 +237,31 @@ class BaseManager(ManagerInterface):
 
     job_directory = _job_directory
 
-    def _setup_job_directory(self, job_id):
+    def _setup_job_directory(self, job_id: str) -> "JobDirectory":
         job_directory = self._job_directory(job_id)
         job_directory.setup()
-        for directory in [JOB_DIRECTORY_INPUTS,
-                          JOB_DIRECTORY_WORKING,
-                          JOB_DIRECTORY_OUTPUTS,
-                          JOB_DIRECTORY_CONFIGS,
-                          JOB_DIRECTORY_TOOL_FILES,
-                          JOB_DIRECTORY_METADATA]:
+        for directory in [
+            JOB_DIRECTORY_INPUTS,
+            JOB_DIRECTORY_WORKING,
+            JOB_DIRECTORY_OUTPUTS,
+            JOB_DIRECTORY_CONFIGS,
+            JOB_DIRECTORY_TOOL_FILES,
+            JOB_DIRECTORY_METADATA,
+        ]:
             job_directory.make_directory(directory)
         return job_directory
 
-    def _get_authorization(self, job_id, tool_id):
+    def _get_authorization(
+        self, job_id: str, tool_id: Optional[str]
+    ) -> "ToolBasedAuthorization":
         return self.authorizer.get_authorization(tool_id)
 
-    def _check_execution(self, job_id, tool_id, command_line):
-        log.debug("job_id: {} - Checking authorization of command_line [{}]".format(job_id, command_line))
+    def _check_execution(
+        self, job_id: str, tool_id: Optional[str], command_line: str
+    ) -> None:
+        log.debug(
+            f"job_id: {job_id} - Checking authorization of command_line [{command_line}]"
+        )
         authorization = self._get_authorization(job_id, tool_id)
         job_directory = self._job_directory(job_id)
         self.user_auth_manager.authorize(job_id, job_directory)
@@ -186,8 +270,9 @@ class BaseManager(ManagerInterface):
         for file in self._list_dir(tool_files_dir):
             if os.path.isdir(join(tool_files_dir, file)):
                 continue
-            contents = open(join(tool_files_dir, file), "rb").read()
-            log.debug("job_id: {} - checking tool file {}".format(job_id, file))
+            with open(join(tool_files_dir, file), "rb") as fh:
+                contents = fh.read()
+            log.debug(f"job_id: {job_id} - checking tool file {file}")
             authorization.authorize_tool_file(basename(file), contents)
         config_files_dir = job_directory.configs_directory()
         for file in self._list_dir(config_files_dir):
@@ -195,18 +280,26 @@ class BaseManager(ManagerInterface):
             authorization.authorize_config_file(job_directory, file, path)
         authorization.authorize_execution(job_directory, command_line)
 
-    def _list_dir(self, directory_or_none):
+    def _list_dir(self, directory_or_none: Optional[str]) -> List[str]:
         if directory_or_none is None or not exists(directory_or_none):
             return []
         else:
             return listdir(directory_or_none)
 
-    def _expand_command_line(self, job_id, command_line: str, dependencies_description, job_directory=None) -> str:
+    def _expand_command_line(
+        self,
+        job_id: str,
+        command_line: str,
+        dependencies_description: Optional["DependenciesDescription"],
+        job_directory: Optional[str] = None,
+    ) -> str:
         if dependencies_description is None:
             return command_line
 
         requirements = dependencies_description.requirements
-        installed_tool_dependencies = dependencies_description.installed_tool_dependencies
+        installed_tool_dependencies = (
+            dependencies_description.installed_tool_dependencies
+        )
         dependency_commands = self.dependency_manager.dependency_shell_commands(
             requirements=requirements,
             installed_tool_dependencies=installed_tool_dependencies,
@@ -216,25 +309,33 @@ class BaseManager(ManagerInterface):
             command_line = "{}; {}".format("; ".join(dependency_commands), command_line)
         return command_line
 
-    def setup_job(self, input_job_id, tool_id, tool_version):
+    @abstractmethod
+    def _setup_job_for_job_id(
+        self, job_id: str, tool_id: Optional[str], tool_version: Optional[str]
+    ) -> str:
+        ...
+
+    def setup_job(
+        self, input_job_id: str, tool_id: Optional[str], tool_version: Optional[str]
+    ) -> str:
         job_id = self._get_job_id(input_job_id)
         return self._setup_job_for_job_id(job_id, tool_id, tool_version)
 
-    def _get_job_id(self, input_job_id):
+    def _get_job_id(self, input_job_id: str) -> str:
         return str(self.id_assigner(input_job_id))
 
-    def __str__(self):
-        return "{}[name={}]".format(type(self).__name__, self.name)
+    def __str__(self) -> str:
+        return f"{type(self).__name__}[name={self.name}]"
+
+    # TODO is this correct? BaseDrmaaManager.shutdown() calls super().shutdown() but no parent class defined shutdown
+    def shutdown(self, timeout: Optional[float] = None) -> None:
+        pass
 
 
 class JobDirectory(RemoteJobDirectory):
 
     def __init__(
-        self,
-        staging_directory,
-        job_id,
-        lock_manager=None,
-        directory_maker=None
+        self, staging_directory, job_id, lock_manager=None, directory_maker=None
     ):
         super().__init__(staging_directory, remote_id=job_id, remote_sep=sep)
         self._directory_maker = directory_maker or DirectoryMaker()
@@ -242,22 +343,29 @@ class JobDirectory(RemoteJobDirectory):
         # Assert this job id isn't hacking path somehow.
         assert job_id == basename(job_id)
 
-    def _job_file(self, name):
+    def _job_file(self, name: str) -> str:
         return os.path.join(self.job_directory, name)
 
-    def calculate_path(self, remote_path, input_type):
-        """ Verify remote_path is in directory for input_type inputs
+    def calculate_path(self, remote_path: str, input_type: str) -> str:
+        """Verify remote_path is in directory for input_type inputs
         and create directory if needed.
         """
-        directory, allow_nested_files, allow_globs = self._directory_for_file_type(input_type)
-        path = get_mapped_file(directory, remote_path, allow_nested_files=allow_nested_files, allow_globs=allow_globs)
+        directory, allow_nested_files, allow_globs = self._directory_for_file_type(
+            input_type
+        )
+        path = get_mapped_file(
+            directory,
+            remote_path,
+            allow_nested_files=allow_nested_files,
+            allow_globs=allow_globs,
+        )
         return path
 
-    def read_file(self, name, size=-1, default=None):
+    def read_file(self, name: str, size: int = -1, default: Any = None) -> bytes:
         path = self._job_file(name)
         job_file = None
         try:
-            job_file = open(path, 'rb')
+            job_file = open(path, "rb")
             return job_file.read(size)
         except Exception:
             if default is not None:
@@ -268,9 +376,32 @@ class JobDirectory(RemoteJobDirectory):
             if job_file:
                 job_file.close()
 
-    def write_file(self, name, contents):
+    def read_stream(self, name: str, size: int, default: Optional[bytes] = None) -> bytes:
+        """Read a stdout/stderr file, keeping its start and end if longer than ``size``.
+
+        The end of a stream is usually where a failing tool says why.
+        """
+        try:
+            with open(self._job_file(name), "rb") as stream:
+                if size < 0 or os.fstat(stream.fileno()).st_size <= size:
+                    return stream.read()
+                return shrink_stream(stream, size)
+        except Exception:
+            if default is not None:
+                return default
+            raise
+
+    def write_file(self, name: str, contents: Union[str, bytes], atomic: bool = False) -> str:
         path = self._job_file(name)
-        job_file = open(path, 'wb')
+        if atomic:
+            if isinstance(contents, str):
+                contents = contents.encode("UTF-8")
+            temp_path = "%s.tmp.%d" % (path, threading.get_ident())
+            with open(temp_path, "wb") as temp_file:
+                temp_file.write(contents)
+            os.replace(temp_path, path)
+            return path
+        job_file = open(path, "wb")
         try:
             if isinstance(contents, str):
                 contents = contents.encode("UTF-8")
@@ -279,7 +410,7 @@ class JobDirectory(RemoteJobDirectory):
             job_file.close()
         return path
 
-    def remove_file(self, name):
+    def remove_file(self, name: str) -> None:
         """
         Quietly remove a job file.
         """
@@ -288,30 +419,36 @@ class JobDirectory(RemoteJobDirectory):
         except OSError:
             pass
 
-    def contains_file(self, name):
+    def contains_file(self, name: str) -> bool:
         return os.path.exists(self._job_file(name))
 
-    def open_file(self, name, mode='wb'):
+    def open_file(self, name: str, mode="wb") -> IO:
         return open(self._job_file(name), mode)
 
-    def exists(self):
+    def file_size(self, name: str) -> int:
+        return os.path.getsize(self._job_file(name))
+
+    def exists(self) -> bool:
         return os.path.exists(self.path)
 
-    def delete(self):
+    # TODO we could remove the return statement, since shutil.rmtree returns None
+    def delete(self) -> None:
         return rmtree(self.path)
 
-    def setup(self):
+    def setup(self) -> None:
         self._directory_maker.make(self.job_directory)
 
-    def make_directory(self, name):
+    def make_directory(self, name: str) -> None:
         path = self._job_file(name)
         self._directory_maker.make(path)
 
-    def lock(self, name=".state"):
-        assert self.lock_manager, "Can only use job directory locks if lock manager defined."
+    def lock(self, name: str = ".state") -> Union["Lock", "LockFile"]:
+        assert (
+            self.lock_manager
+        ), "Can only use job directory locks if lock manager defined."
         return self.lock_manager.get_lock(self._job_file(name))
 
-    def working_directory_file_contents(self, name):
+    def working_directory_file_contents(self, name: str) -> Optional[bytes]:
         working_directory = self.working_directory()
         working_directory_path = join(working_directory, name)
         if exists(working_directory_path):
@@ -320,23 +457,23 @@ class JobDirectory(RemoteJobDirectory):
         else:
             return None
 
-    def working_directory_contents(self):
+    def working_directory_contents(self) -> List[str]:
         working_directory = self.working_directory()
         return self.__directory_contents(working_directory)
 
-    def outputs_directory_contents(self):
+    def outputs_directory_contents(self) -> List[str]:
         outputs_directory = self.outputs_directory()
         return self.__directory_contents(outputs_directory)
 
-    def metadata_directory_contents(self):
+    def metadata_directory_contents(self) -> List[str]:
         metadata_directory = self.metadata_directory()
         return self.__directory_contents(metadata_directory)
 
-    def job_directory_contents(self):
+    def job_directory_contents(self) -> List[str]:
         # Set recursive to False to just get the top-level artifacts
         return self.__directory_contents(self.job_directory, recursive=False)
 
-    def __directory_contents(self, directory, recursive=True):
+    def __directory_contents(self, directory: str, recursive: bool = True) -> List[str]:
         contents = []
         if recursive:
             for path, _, files in walk(directory):
@@ -355,10 +492,10 @@ class JobDirectory(RemoteJobDirectory):
         return contents
 
     # Following abstractions store metadata related to jobs.
-    def store_metadata(self, metadata_name, metadata_value):
-        self.write_file(metadata_name, json.dumps(metadata_value))
+    def store_metadata(self, metadata_name: str, metadata_value: Any, atomic: bool = False) -> None:
+        self.write_file(metadata_name, json.dumps(metadata_value), atomic=atomic)
 
-    def load_metadata(self, metadata_name, default=None):
+    def load_metadata(self, metadata_name: str, default: Optional[Any] = None) -> Any:
         DEFAULT_RAW = object()
         contents = self.read_file(metadata_name, default=DEFAULT_RAW)
         if contents is DEFAULT_RAW:
@@ -366,10 +503,10 @@ class JobDirectory(RemoteJobDirectory):
         else:
             return json.loads(contents.decode())
 
-    def has_metadata(self, metadata_name):
+    def has_metadata(self, metadata_name: str) -> bool:
         return self.contains_file(metadata_name)
 
-    def remove_metadata(self, metadata_name):
+    def remove_metadata(self, metadata_name: str) -> None:
         self.remove_file(metadata_name)
 
 

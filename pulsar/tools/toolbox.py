@@ -8,7 +8,7 @@ from typing import (
     List,
     Union,
 )
-from xml.etree import ElementTree
+from xml.etree import ElementTree as ET
 
 from pulsar.tools.validator import ExpressionValidator
 
@@ -27,7 +27,7 @@ class ToolBox:
         self.tool_configs: List[Union[SimpleToolConfig, ToolShedToolConfig]] = []
         paths = [path.strip() for path in path_string.split(",")]
         for path in paths:
-            toolbox_tree = ElementTree.parse(path)
+            toolbox_tree = ET.parse(path)
             toolbox_root = toolbox_tree.getroot()
             tool_path = toolbox_root.get('tool_path')
             self.__load_tools_from_els(toolbox_root, tool_path)
@@ -72,7 +72,8 @@ class InputsValidator:
         config_validator = self.config_validators.get(name, None)
         valid = True
         if config_validator:
-            contents = open(path, encoding="UTF-8").read()
+            with open(path, encoding="UTF-8") as fh:
+                contents = fh.read()
             valid = config_validator.validate(job_directory, contents)
         return valid
 
@@ -104,7 +105,7 @@ class ToolConfig:
         return self._el().getroot()
 
     def _el(self):
-        return ElementTree.parse(self.path)
+        return ET.parse(self.path)
 
 
 class SimpleToolConfig(ToolConfig):

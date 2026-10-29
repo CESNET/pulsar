@@ -19,3 +19,11 @@
 ## If using a manager that runs jobs as real users, be sure to load your Python
 ## environement in here as well.
 # . .venv/bin/activate
+
+## Any PULSAR_CONFIG_<KEY> variable here becomes the config key <KEY> at the top
+## level of the app configuration, so it can supply a value not set in app.yml
+## (an app.yml value, or PULSAR_CONFIG_OVERRIDE_<KEY>, wins). For example these
+## set a global default for the shell injected before/after every job's main
+## command - overridable per manager in app.yml (see app.yml.sample):
+#export PULSAR_CONFIG_JOB_PRE_COMMANDS="source /opt/cesnet/env/pre.sh"
+#export PULSAR_CONFIG_JOB_POST_COMMANDS="echo finished; /opt/cesnet/env/cleanup.sh"

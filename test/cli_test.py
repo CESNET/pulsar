@@ -1,11 +1,14 @@
+from pulsar.managers import status
+from pulsar.managers.queued_cli import _CLI_STATE_TO_STATUS
 from pulsar.managers.util.cli import factory
+from pulsar.managers.util.cli.job import job_states
 
 
 def test_torque_cli():
-    job_params = dict(
-        plugin="Torque",
-        Priority="4",
-    )
+    job_params = {
+        "plugin": "Torque",
+        "Priority": "4",
+    }
     job = __build_job_interface(job_params)
 
     command = job.submit("/tmp/path/test.sh")
@@ -23,7 +26,7 @@ def test_torque_cli():
     assert "#PBS -p 4" in headers
 
     # Verify it just skips invalid status...
-    assert job.parse_status("Warning: Network Proble.", ["24", "25"]) is None
+    assert job.parse_status("Warning: Network Problem.", ["24", "25"]) is None
 
     output = "<Data><Job><Job_Id>24</Job_Id><job_state>Q</job_state></Job>"
     output += "<Job><Job_Id>25</Job_Id><job_state>E</job_state></Job>"
@@ -35,10 +38,10 @@ def test_torque_cli():
 
 
 def test_slurm_cli():
-    job_params = dict(
-        plugin="Slurm",
-        ncpus=5
-    )
+    job_params = {
+        "plugin": "Slurm",
+        "ncpus": 5
+    }
     job = __build_job_interface(job_params)
 
     command = job.submit("/tmp/path/test.sh")
@@ -72,9 +75,9 @@ def test_slurm_cli():
 
 
 def test_slurm_torque():
-    job_params = dict(
-        plugin="SlurmTorque",
-    )
+    job_params = {
+        "plugin": "SlurmTorque",
+    }
     job = __build_job_interface(job_params)
 
     command = job.submit("/tmp/path/test.sh")
@@ -89,6 +92,16 @@ def test_slurm_torque():
     stats = job.parse_status(output, ["24", "25"])
     assert stats.get("24", None) == "running", stats
     assert "25" not in stats
+
+
+def test_cli_state_to_pulsar_status():
+    # The CLI plugins (shared with Galaxy) speak job_states; the queued_cli
+    # manager must translate them into Pulsar's status vocabulary regardless of
+    # how job_states is bound (galaxy.model.Job.states vs Pulsar's fallback).
+    assert _CLI_STATE_TO_STATUS[job_states.OK] == status.COMPLETE
+    assert _CLI_STATE_TO_STATUS[job_states.RUNNING] == status.RUNNING
+    assert _CLI_STATE_TO_STATUS[job_states.QUEUED] == status.QUEUED
+    assert _CLI_STATE_TO_STATUS[job_states.ERROR] == status.FAILED
 
 
 def __build_job_interface(job_params):
