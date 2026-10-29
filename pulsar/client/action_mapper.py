@@ -188,12 +188,13 @@ class FileActionMapper:
     'remote_copy'
     """
 
-    def __init__(self, client=None, config=None):
+    def __init__(self, client=None, config=None, transfer_defaults=None):
         if config is None and client is None:
             message = "FileActionMapper must be constructed from either a client or a config dictionary."
             raise Exception(message)
         if config is None:
             config = self.__client_to_config(client)
+        self.transfer_defaults = transfer_defaults or {}
         self.default_action = config.get("default_action", "transfer")
         self.ssh_key = config.get("ssh_key", None)
         self.ssh_user = config.get("ssh_user", None)
@@ -280,6 +281,8 @@ class FileActionMapper:
             self.__inject_url(action, file_type)
         if getattr(action, "inject_ssh_properties", False):
             self.__inject_ssh_properties(action)
+        if getattr(action, "inject_transfer_options", False):
+            apply_transfer_defaults(action, self.transfer_defaults)
 
     def __inject_url(self, action, file_type):
         url_base = self.files_endpoint
@@ -549,28 +552,48 @@ class PubkeyAuthenticatedTransferAction(BaseAction):
     """Base class for file transfers requiring an SSH public/private key
     """
     inject_ssh_properties = True
+    inject_transfer_options = True
     action_spec: ClassVar[Dict[str, Any]] = {
         'ssh_key': UNSET_ACTION_KWD,
         'ssh_user': UNSET_ACTION_KWD,
         'ssh_host': UNSET_ACTION_KWD,
         'ssh_port': UNSET_ACTION_KWD,
+        'recursive': UNSET_ACTION_KWD,
+        'ssh_options': UNSET_ACTION_KWD,
+        'rsync_options': UNSET_ACTION_KWD,
     }
     staging = STAGING_ACTION_REMOTE
 
     def __init__(self, source, file_lister=None, ssh_user=UNSET_ACTION_KWD,
-                 ssh_host=UNSET_ACTION_KWD, ssh_port=UNSET_ACTION_KWD, ssh_key=UNSET_ACTION_KWD):
+                 ssh_host=UNSET_ACTION_KWD, ssh_port=UNSET_ACTION_KWD, ssh_key=UNSET_ACTION_KWD,
+                 recursive=UNSET_ACTION_KWD, ssh_options=UNSET_ACTION_KWD,
+                 rsync_options=UNSET_ACTION_KWD):
         super().__init__(source, file_lister=file_lister)
         self.ssh_user = ssh_user
         self.ssh_host = ssh_host
         self.ssh_port = ssh_port
         self.ssh_key = ssh_key
+        self.recursive = recursive
+        self.ssh_options = ssh_options
+        self.rsync_options = rsync_options
 
     def to_dict(self):
         return self._extend_base_dict(
             ssh_user=self.ssh_user,
             ssh_host=self.ssh_host,
-            ssh_port=self.ssh_port
+            ssh_port=self.ssh_port,
+            recursive=self.recursive,
+            ssh_options=self.ssh_options,
+            rsync_options=self.rsync_options
         )
+
+    def resolved_transfer_options(self):
+        """Resolve transfer options, treating anything never configured (by the
+        mapping, the client, or the Pulsar server) as the default (off/empty)."""
+        recursive = _as_bool(self.recursive) if self.recursive != UNSET_ACTION_KWD else False
+        ssh_options = _option_list(self.ssh_options)
+        rsync_options = _option_list(self.rsync_options)
+        return recursive, ssh_options, rsync_options
 
     @contextmanager
     def _serialized_key(self):
@@ -600,17 +623,25 @@ class RsyncTransferAction(PubkeyAuthenticatedTransferAction):
                                    ssh_user=action_dict["ssh_user"],
                                    ssh_host=action_dict["ssh_host"],
                                    ssh_port=action_dict["ssh_port"],
-                                   ssh_key=action_dict["ssh_key"])
+                                   ssh_key=action_dict["ssh_key"],
+                                   recursive=action_dict.get("recursive", UNSET_ACTION_KWD),
+                                   ssh_options=action_dict.get("ssh_options", UNSET_ACTION_KWD),
+                                   rsync_options=action_dict.get("rsync_options", UNSET_ACTION_KWD))
 
     def write_to_path(self, path):
+        recursive, ssh_options, rsync_options = self.resolved_transfer_options()
         with self._serialized_key() as key_file:
             rsync_get_file(self.path, path, self.ssh_user, self.ssh_host,
-                           self.ssh_port, key_file)
+                           self.ssh_port, key_file, recursive=recursive,
+                           rsync_options=rsync_options, ssh_options=ssh_options)
 
     def write_from_path(self, pulsar_path):
+        recursive, ssh_options, rsync_options = self.resolved_transfer_options()
         with self._serialized_key() as key_file:
             rsync_post_file(pulsar_path, self.path, self.ssh_user,
-                            self.ssh_host, self.ssh_port, key_file)
+                            self.ssh_host, self.ssh_port, key_file,
+                            recursive=recursive, rsync_options=rsync_options,
+                            ssh_options=ssh_options)
 
 
 class ScpTransferAction(PubkeyAuthenticatedTransferAction):
@@ -622,17 +653,53 @@ class ScpTransferAction(PubkeyAuthenticatedTransferAction):
                                  ssh_user=action_dict["ssh_user"],
                                  ssh_host=action_dict["ssh_host"],
                                  ssh_port=action_dict["ssh_port"],
-                                 ssh_key=action_dict["ssh_key"])
+                                 ssh_key=action_dict["ssh_key"],
+                                 recursive=action_dict.get("recursive", UNSET_ACTION_KWD),
+                                 ssh_options=action_dict.get("ssh_options", UNSET_ACTION_KWD))
 
     def write_to_path(self, path):
+        recursive, ssh_options, _ = self.resolved_transfer_options()
         with self._serialized_key() as key_file:
             scp_get_file(self.path, path, self.ssh_user, self.ssh_host,
-                         self.ssh_port, key_file)
+                         self.ssh_port, key_file, recursive=recursive,
+                         ssh_options=ssh_options)
 
     def write_from_path(self, pulsar_path):
+        recursive, ssh_options, _ = self.resolved_transfer_options()
         with self._serialized_key() as key_file:
             scp_post_file(pulsar_path, self.path, self.ssh_user, self.ssh_host,
-                          self.ssh_port, key_file)
+                          self.ssh_port, key_file, recursive=recursive,
+                          ssh_options=ssh_options)
+
+
+def _as_bool(value):
+    if isinstance(value, str):
+        return value.lower() in ("true", "yes", "on", "1")
+    return bool(value)
+
+
+def _option_list(value):
+    """Accept option collections from YAML/JSON configuration (lists) or as
+    simple whitespace separated strings."""
+    if value is None or value == UNSET_ACTION_KWD:
+        return []
+    if isinstance(value, str):
+        return value.split()
+    return [str(option) for option in value]
+
+
+def apply_transfer_defaults(action, transfer_defaults):
+    """Apply Pulsar server (app.yml) defaults for SSH transfer options.
+
+    Options configured per-path (in Galaxy's file actions mapping) always win,
+    these only fill in options the action left unset.
+    """
+    if not transfer_defaults or not getattr(action, "inject_transfer_options", False):
+        return
+    for key in ("recursive", "ssh_options", "rsync_options"):
+        value = transfer_defaults.get(key)
+        if value is not None and getattr(action, key, UNSET_ACTION_KWD) == UNSET_ACTION_KWD:
+            setattr(action, key, value)
 
 
 class MessageAction:

@@ -30,6 +30,7 @@ def postprocess(
     job_directory: "JobDirectory",
     action_executor: "RetryActionExecutor",
     was_cancelled: Callable[[], Optional[bool]],
+    transfer_options: Optional[Dict[str, Any]] = None,
 ) -> bool:
     # Returns True if outputs were collected.
     if job_directory.has_metadata("launch_config"):
@@ -39,7 +40,7 @@ def postprocess(
     else:
         staging_config = {}
     return __collect_outputs(
-        job_directory, staging_config, action_executor, was_cancelled
+        job_directory, staging_config, action_executor, was_cancelled, transfer_options
     )
 
 
@@ -48,11 +49,13 @@ def __collect_outputs(
     staging_config: Dict[str, Any],
     action_executor: "RetryActionExecutor",
     was_cancelled,
+    transfer_options: Optional[Dict[str, Any]] = None,
 ) -> bool:
     collected = True
     if "action_mapper" in staging_config:
         file_action_mapper = action_mapper.FileActionMapper(
-            config=staging_config["action_mapper"]
+            config=staging_config["action_mapper"],
+            transfer_defaults=transfer_options,
         )
         client_outputs = ClientOutputs.from_dict(
             staging_config["client_outputs"]

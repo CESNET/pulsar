@@ -3,6 +3,7 @@
 
 import logging
 from typing import (
+    Any,
     Callable,
     Dict,
     List,
@@ -10,7 +11,10 @@ from typing import (
     TYPE_CHECKING,
 )
 
-from pulsar.client.action_mapper import from_dict
+from pulsar.client.action_mapper import (
+    apply_transfer_defaults,
+    from_dict,
+)
 
 if TYPE_CHECKING:
     from galaxy.objectstore import ObjectStore
@@ -27,6 +31,7 @@ def preprocess(
     action_executor: "RetryActionExecutor",
     was_cancelled: Callable[[], Optional[bool]],
     object_store: Optional["ObjectStore"] = None,
+    transfer_options: Optional[Dict[str, Any]] = None,
 ):
     for setup_action in setup_actions:
         if was_cancelled():
@@ -37,6 +42,7 @@ def preprocess(
         action = from_dict(setup_action["action"])
         if getattr(action, "inject_object_store", False):
             action.object_store = object_store
+        apply_transfer_defaults(action, transfer_options)
         path = job_directory.calculate_path(name, input_type)
         description = f"Staging {input_type} '{name}' via {action} to {path}"
         log.debug(description)
