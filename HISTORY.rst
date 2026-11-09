@@ -8,6 +8,9 @@ History
 ---------------------
 0.16.1.dev0
 ---------------------
+* Record preprocess and postprocess file transfer time, count, and bytes for
+  Galaxy's ``pulsar`` job metrics plugin. `Pull Request 518`_
+* Skip unavailable job metrics plugins in Pulsar's shared configuration. `Pull Request 518`_
 * Fix the Ruff 0.17 datetime import-alias lint failures. `Pull Request 546`_
 * Send all chunks of a ``remote_transfer_tus`` stage-out over one connection
   instead of a new TCP and TLS connection per chunk, using a built-in tus
@@ -16,6 +19,17 @@ History
   out stalled requests (``PULSAR_TUS_TIMEOUT``). A failed TUS upload of a
   working-directory output now fails the job instead of only logging a
   warning. `Pull Request 549`_
+* Add a ``remote_pulsar_version`` destination parameter to declare the remote
+  Pulsar's version for ``jobs_directory`` destinations, which never contact
+  Pulsar to learn it. The version of published ``galaxy/pulsar-pod-staging``
+  images is known without it. Job configs now record where ``pulsar_version``
+  came from, so Galaxy no longer mistakes the client library's version for the
+  remote's. `Issue 135`_
+* Keep Google Cloud Batch job names stable across Pulsar clients and record the
+  launched name as the job's external id, so Galaxy polls and stops the right
+  job after a resubmission. Add ``job_id_prefix`` (validated against GCP's job
+  name rules) and ``gcp_kill_action: delete|cancel`` destination parameters.
+  `Pull Request 473`_
 
 
 
@@ -780,6 +794,8 @@ History
 .. github_links
 .. _Pull Request 549: https://github.com/galaxyproject/pulsar/pull/549
 .. _Pull Request 546: https://github.com/galaxyproject/pulsar/pull/546
+.. _Pull Request 518: https://github.com/galaxyproject/pulsar/pull/518
+.. _Pull Request 473: https://github.com/galaxyproject/pulsar/pull/473
 .. _Pull Request 537: https://github.com/galaxyproject/pulsar/pull/537
 .. _Pull Request 543: https://github.com/galaxyproject/pulsar/pull/543
 .. _Pull Request 540: https://github.com/galaxyproject/pulsar/pull/540
@@ -829,6 +845,7 @@ History
 .. _Issue 393: https://github.com/galaxyproject/pulsar/issues/393
 .. _Issue 354: https://github.com/galaxyproject/pulsar/issues/354
 .. _Issue 158: https://github.com/galaxyproject/pulsar/issues/158
+.. _Issue 135: https://github.com/galaxyproject/pulsar/issues/135
 .. _Pull Request 470: https://github.com/galaxyproject/pulsar/pull/470
 .. _Pull Request 466: https://github.com/galaxyproject/pulsar/pull/466
 .. _Pull Request 464: https://github.com/galaxyproject/pulsar/pull/464

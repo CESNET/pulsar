@@ -14,6 +14,33 @@ MANAGER_PREFIX = 'manager:'
 DEFAULT_MANAGER_NAME = '_default_'
 DEFAULT_MANAGER_TYPE = 'queued_python'
 
+# Primary -> legacy alias for the shell injected before/after the main job
+# command. Config may use either name at the top level or per manager; the
+# primary name is canonical internally (and in BaseManager).
+COMMAND_COMMAND_ALIASES = {
+    "job_pre_commands": "instrument_pre_commands",
+    "job_post_commands": "instrument_post_commands",
+}
+
+
+def _normalize_command_aliases(options):
+    """Return a copy of ``options`` with legacy ``instrument_*`` keys collapsed
+    onto their primary ``job_*`` keys. A key already set under the primary name
+    wins; the alias is dropped either way so only the primary name survives."""
+    normalized = dict(options)
+    for primary, alias in COMMAND_COMMAND_ALIASES.items():
+        if alias in normalized:
+            value = normalized.pop(alias)
+            normalized.setdefault(primary, value)
+    return normalized
+
+
+def _first_present(conf, keys):
+    for key in keys:
+        if conf.get(key, None) is not None:
+            return conf[key]
+    return None
+
 
 def build_managers(app, conf):
     """
@@ -42,7 +69,10 @@ def build_managers(app, conf):
     managers = {}
     for manager_name, manager_description in manager_descriptions.descriptions.items():
         manager_options = dict(default_options)
-        manager_options.update(manager_description.manager_options)
+        # Collapse this manager's own legacy ``instrument_*`` names onto the
+        # primary ``job_*`` keys before merging, so a per-manager value set via
+        # the alias still overrides a global default set via the primary key.
+        manager_options.update(_normalize_command_aliases(manager_description.manager_options))
 
         manager_class = manager_classes[manager_description.manager_type]
         manager = _build_manager(manager_class, app, manager_name, manager_options)
@@ -86,6 +116,14 @@ def _get_default_options(conf):
     ]:
         if conf.get(stdout_update_key, None) is not None:
             options[stdout_update_key] = conf[stdout_update_key]
+    # Pre/post job commands set at the top level (app.yml or a PULSAR_CONFIG_*
+    # env var, e.g. from local_env.sh) act as a default for every manager,
+    # overridable per-manager below. The legacy ``instrument_*`` names are
+    # accepted and normalized to the primary ``job_*`` key.
+    for primary, alias in COMMAND_COMMAND_ALIASES.items():
+        value = _first_present(conf, (primary, alias))
+        if value is not None:
+            options[primary] = value
     return options
 
 
