@@ -157,15 +157,22 @@ def job_script(template=DEFAULT_JOB_FILE_TEMPLATE, **kwds):
         raise Exception("Failed to create job_script, a required parameter is missing.")
     metadata_directory = kwds.get("metadata_directory", kwds["working_directory"])
     job_instrumenter = kwds.get("job_instrumenter")
+    # Commands configured on the manager (app.yml ``job_pre_commands`` /
+    # ``job_post_commands``) arrive already set as the instrument slots; the
+    # job-instrumenter (job metrics) writes the same slots, so merge rather than
+    # overwrite - configured commands wrap the instrumenter's so custom setup
+    # runs first and teardown last without dropping job metrics.
+    configured_pre = kwds.get("instrument_pre_commands") or ""
+    configured_post = kwds.get("instrument_post_commands") or ""
     if job_instrumenter:
         del kwds["job_instrumenter"]
         working_directory = kwds.get("metadata_directory", kwds["working_directory"])
-        kwds["instrument_pre_commands"] = (
-            job_instrumenter.pre_execute_commands(working_directory) or ""
-        )
-        kwds["instrument_post_commands"] = (
-            job_instrumenter.post_execute_commands(working_directory) or ""
-        )
+        instrument_pre = job_instrumenter.pre_execute_commands(working_directory) or ""
+        instrument_post = job_instrumenter.post_execute_commands(working_directory) or ""
+    else:
+        instrument_pre = instrument_post = ""
+    kwds["instrument_pre_commands"] = "\n".join(c for c in (configured_pre, instrument_pre) if c)
+    kwds["instrument_post_commands"] = "\n".join(c for c in (instrument_post, configured_post) if c)
     if "memory_statement" not in kwds:
         kwds["memory_statement"] = MEMORY_STATEMENT_DEFAULT_TEMPLATE.safe_substitute(
             metadata_directory=metadata_directory
