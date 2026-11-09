@@ -1,6 +1,7 @@
 """
 Condor helper utilities.
 """
+
 from subprocess import (
     CalledProcessError,
     check_call,
@@ -13,11 +14,11 @@ from galaxy.util import (
 
 from ..external import parse_external_id
 
-DEFAULT_QUERY_CLASSAD = dict(
-    universe="vanilla",
-    getenv="true",
-    notification="NEVER",
-)
+DEFAULT_QUERY_CLASSAD = {
+    "universe": "vanilla",
+    "getenv": "true",
+    "notification": "NEVER",
+}
 
 PROBLEM_PARSING_EXTERNAL_ID = "Failed to find job id from condor_submit"
 

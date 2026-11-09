@@ -18,6 +18,8 @@ Contents:
    job_managers
    containers
    galaxy_conf
+   compatibility
+   error_handling
    scripts
    conduct
    contributing
@@ -32,4 +34,3 @@ Indices and tables
 * :ref:`genindex`
 * :ref:`modindex`
 * :ref:`search`
-

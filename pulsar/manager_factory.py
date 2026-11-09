@@ -2,6 +2,7 @@ import configparser
 import inspect
 import logging
 import os
+from typing import List
 
 import pulsar.managers
 from pulsar.managers import stateful
@@ -52,7 +53,8 @@ def build_managers(app, conf):
 
 def _populate_manager_descriptions_from_ini(manager_descriptions, job_managers_config):
     config = configparser.ConfigParser()
-    config.readfp(open(job_managers_config))
+    with open(job_managers_config) as fh:
+        config.read_file(fh)
     for section in config.sections():
         if not section.startswith(MANAGER_PREFIX):
             continue
@@ -76,6 +78,14 @@ def _get_default_options(conf):
     options["job_directory_mode"] = None
     if job_directory_mode is not None:
         options["job_directory_mode"] = int(job_directory_mode, 8)
+    for stdout_update_key in [
+        "send_stdout_update",
+        "stdout_update_interval",
+        "stdout_update_timeout",
+        "stdout_update_chunk_size",
+    ]:
+        if conf.get(stdout_update_key, None) is not None:
+            options[stdout_update_key] = conf[stdout_update_key]
     return options
 
 
@@ -83,7 +93,7 @@ def _build_manager(manager_class, app, name=DEFAULT_MANAGER_NAME, manager_option
     return stateful.StatefulManagerProxy(manager_class(name, app, **manager_options), **manager_options)
 
 
-def _get_manager_modules():
+def _get_manager_modules() -> List[str]:
     """
 
     >>> 'pulsar.managers.queued_pbs' in _get_manager_modules()
@@ -110,8 +120,8 @@ def _load_manager_modules():
             modules.append(module)
         except BaseException as exception:
             exception_str = str(exception)
-            message = "{} manager module could not be loaded: {}".format(manager_module_name, exception_str)
-            log.warn(message)
+            message = f"{manager_module_name} manager module could not be loaded: {exception_str}"
+            log.warning(message)
             continue
 
     return modules
@@ -157,7 +167,7 @@ class ManagerDescription:
 
     @staticmethod
     def from_ini_config(config, manager_name):
-        section_name = '{}{}'.format(MANAGER_PREFIX, manager_name)
+        section_name = f'{MANAGER_PREFIX}{manager_name}'
         try:
             manager_type = config.get(section_name, 'type')
         except ValueError:

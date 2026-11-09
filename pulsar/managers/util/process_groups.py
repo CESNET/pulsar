@@ -10,7 +10,7 @@ log = logging.getLogger(__name__)
 def check_pg(pgid):
     """Check whether processes in process group pgid are still alive."""
     try:
-        (pid, exit_status) = os.waitpid(-pgid, os.WNOHANG)
+        (pid, _exit_status) = os.waitpid(-pgid, os.WNOHANG)
     except OSError as e:
         if e.errno == errno.ECHILD:
             log.debug("check_pg(): No process found in process group %d", pgid)
@@ -44,7 +44,14 @@ def kill_pg(pgid):
             )
         sleep(1)
         if not check_pg(pgid):
-            log.debug("Processes in process group %d successfully killed with signal %d", pgid, sig)
+            log.debug(
+                "Processes in process group %d successfully killed with signal %d",
+                pgid,
+                sig,
+            )
             return
     else:
-        log.warning("Some process in process group %d refuses to die after signaling TERM/KILL", pgid)
+        log.warning(
+            "Some process in process group %d refuses to die after signaling TERM/KILL",
+            pgid,
+        )

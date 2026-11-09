@@ -9,6 +9,7 @@ from galaxy.util import (
 
 from pulsar import manager_endpoint_util
 from pulsar.client import amqp_exchange_factory
+from .outbox import build_status_outbox
 
 log = logging.getLogger(__name__)
 
@@ -40,9 +41,15 @@ def get_exchange(connection_string, manager_name, conf):
     return pulsar_exchange
 
 
-def bind_manager_to_queue(manager, queue_state, connection_string, conf):
+def bind_manager_to_queue(
+    manager,
+    queue_state,
+    connection_string,
+    conf,
+    start_monitor=True,
+):
     manager_name = manager.name
-    log.info("bind_manager_to_queue called for [{}] and manager [{}]".format(mask_password_from_url(connection_string), manager_name))
+    log.info(f"bind_manager_to_queue called for [{mask_password_from_url(connection_string)}] and manager [{manager_name}]")
     pulsar_exchange = get_exchange(connection_string, manager_name, conf)
 
     process_setup_messages = functools.partial(__process_setup_message, manager)
@@ -63,26 +70,42 @@ def bind_manager_to_queue(manager, queue_state, connection_string, conf):
             status_update_ack_thread = start_status_update_ack_consumer(pulsar_exchange, functools.partial(drain, None, "status_update_ack"))
             getattr(queue_state, 'threads', []).append(status_update_ack_thread)
 
-    # TODO: Think through job recovery, jobs shouldn't complete until after bind
-    # has occurred.
-    def bind_on_status_change(new_status, job_id):
-        job_id = job_id or 'unknown'
-        try:
-            message = "Publishing Pulsar state change with status {} for job_id {}".format(new_status, job_id)
-            log.debug(message)
-            payload = manager_endpoint_util.full_status(manager, new_status, job_id)
-            pulsar_exchange.publish("status_update", payload)
-        except Exception:
-            log.exception("Failure to publish Pulsar state change for job_id %s." % job_id)
-            raise
-
     if conf.get("message_queue_publish", True):
-        manager.set_state_change_callback(bind_on_status_change)
+        outbox = build_status_outbox(
+            manager,
+            conf,
+            publish_fn=lambda payload: pulsar_exchange.publish("status_update", payload),
+        )
+        if outbox is not None:
+            queue_state.outboxes.append(outbox)
+
+        def bind_on_status_change(new_status, job_id):
+            job_id = job_id or 'unknown'
+            log.debug(
+                "Publishing Pulsar state change with status %s for job_id %s",
+                new_status, job_id,
+            )
+            payload = manager_endpoint_util.full_status(manager, new_status, job_id)
+            if outbox is not None:
+                outbox.enqueue(payload)
+                return
+            try:
+                pulsar_exchange.publish("status_update", payload)
+            except pulsar_exchange.recoverable_exceptions:
+                log.exception(
+                    "Failure to publish Pulsar state change for job_id %s "
+                    "(no outbox configured; status update may be lost).", job_id,
+                )
+
+        manager.set_state_change_callback(
+            bind_on_status_change,
+            start_monitor=start_monitor,
+        )
 
 
 def __start_consumer(name, exchange, target):
     exchange_url = mask_password_from_url(exchange.url)
-    thread_name = "consume-{}-{}".format(name, exchange_url)
+    thread_name = f"consume-{name}-{exchange_url}"
     thread = threading.Thread(name=thread_name, target=target)
     # TODO: If the shutdown code is actually called make this
     # not a daemon.
@@ -116,7 +139,7 @@ def __processes_message(f):
             f(manager, body, job_id)
         except Exception:
             job_id = job_id or 'unknown'
-            log.exception("Failed to process message with function {} for job_id {}".format(f.__name__, job_id))
+            log.exception(f"Failed to process message with function {f.__name__} for job_id {job_id}")
         message.ack()
 
     return process_message

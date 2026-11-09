@@ -1,16 +1,25 @@
-from collections import deque
 import os
+from collections import deque
+from types import SimpleNamespace
 
-from .test_utils import TempDirectoryTestCase
-from pulsar.client.test.test_common import write_config
-from pulsar.client import submit_job, ClientJobDescription
-from pulsar.client import ClientOutputs
+import pytest
+import requests
 from galaxy.tool_util.deps.dependencies import DependenciesDescription
 from galaxy.tool_util.deps.requirements import ToolRequirement
 
+from pulsar.client.exceptions import PulsarClientTransportError
+from pulsar.client.staging.down import ResultsCollector
+from pulsar.client.staging.models import (
+    ClientJobDescription,
+    ClientOutputs,
+)
+from pulsar.client.staging.up import submit_job
+from pulsar.client.test.test_common import write_config
+from .test_utils import TempDirectoryTestCase
+
 TEST_REQUIREMENT_1 = ToolRequirement("test1", "1.0")
 TEST_REQUIREMENT_2 = ToolRequirement("test2", "1.0")
-TEST_ENV_1 = dict(name="x", value="y")
+TEST_ENV_1 = {"name": "x", "value": "y"}
 TEST_TOKEN_ENDPOINT = "endpoint"
 
 
@@ -33,14 +42,14 @@ class TestStager(TempDirectoryTestCase):
             env=[TEST_ENV_1],
             rewrite_paths=False,
         )
-        self.job_config = dict(
-            configs_directory="/pulsar/staging/1/configs",
-            working_directory="/pulsar/staging/1/working",
-            outputs_directory="/pulsar/staging/1/outputs",
-            system_properties=dict(
-                separator="\\",
-            ),
-        )
+        self.job_config = {
+            "configs_directory": "/pulsar/staging/1/configs",
+            "working_directory": "/pulsar/staging/1/working",
+            "outputs_directory": "/pulsar/staging/1/outputs",
+            "system_properties": {
+                "separator": "\\",
+            },
+        }
 
     def __setup_inputs(self):
         files_directory = os.path.join(self.temp_directory, "files")
@@ -82,9 +91,9 @@ class TestStager(TempDirectoryTestCase):
 
     def test_unstructured_rewrite(self):
         self.client_job_description.rewrite_paths = True
-        self.client.set_action_map_config(dict(paths=[
-            dict(path=self.temp_directory, path_types="*any*")
-        ]))
+        self.client.set_action_map_config({"paths": [
+            {"path": self.temp_directory, "path_types": "*any*"}
+        ]})
         local_unstructured_file = os.path.join(self.temp_directory, "A_RANDOM_FILE")
         open(local_unstructured_file, "wb").write(b"Hello World!")
         command_line = "foo.exe %s" % local_unstructured_file
@@ -98,9 +107,9 @@ class TestStager(TempDirectoryTestCase):
 
     def test_file_actions_by_dict(self):
         self.client_job_description.rewrite_paths = True
-        self.client.set_action_map_config(dict(paths=[
-            dict(path=self.temp_directory, path_types="*any*"),
-        ]), by_path=False)
+        self.client.set_action_map_config({"paths": [
+            {"path": self.temp_directory, "path_types": "*any*"},
+        ]}, by_path=False)
         local_unstructured_file = os.path.join(self.temp_directory, "A_RANDOM_FILE")
         open(local_unstructured_file, "wb").write(b"Hello World!")
         command_line = "foo.exe %s" % local_unstructured_file
@@ -181,7 +190,7 @@ class MockClient:
     def launch(self, command_line, dependencies_description, job_config={}, remote_staging={}, env=[], dynamic_file_sources=None,
                token_endpoint=None):
         if self.expected_command_line is not None:
-            message = "Excepected command line {}, got {}".format(self.expected_command_line, command_line)
+            message = f"Excepected command line {self.expected_command_line}, got {command_line}"
             assert self.expected_command_line == command_line, message
         assert dependencies_description.requirements == [TEST_REQUIREMENT_1, TEST_REQUIREMENT_2]
         assert token_endpoint == TEST_TOKEN_ENDPOINT
@@ -193,3 +202,76 @@ class MockClient:
     def put_file(self, path, type, name, contents, action_type='transfer'):
         self.put_files.append((path, type, name, contents))
         return {"path": self.put_paths.popleft()}
+
+
+def _results_collector_with_failing_collect(exc):
+    """Build a minimal ResultsCollector whose output collection raises ``exc``."""
+    output_collector = SimpleNamespace(collect_output=lambda *a, **k: (_ for _ in ()).throw(exc))
+    client_outputs = SimpleNamespace(output_files=[])
+    pulsar_outputs = SimpleNamespace(
+        working_directory_contents=[], metadata_directory_contents=[], job_directory_contents=[]
+    )
+    return ResultsCollector(output_collector, action_mapper=None, client_outputs=client_outputs, pulsar_outputs=pulsar_outputs)
+
+
+def _http_error(status_code):
+    response = requests.Response()
+    response.status_code = status_code
+    return requests.HTTPError(response=response)
+
+
+def test_collect_output_tolerates_403_without_failing_job():
+    """A 403 means Galaxy authoritatively refused the upload (e.g. the output
+    dataset was purged mid-job). Even for a normally-fatal output type this
+    must not fail the job — _collect_output returns without raising, so the
+    exception tracker records no failure."""
+    rc = _results_collector_with_failing_collect(_http_error(403))
+    action = SimpleNamespace(url="http://galaxy.test/api/jobs/1/files?path=/x&file_type=output")
+    assert rc._collect_output("output", action, "out1") is False
+
+
+def test_collect_output_reraises_non_403_for_fatal_output_type():
+    rc = _results_collector_with_failing_collect(_http_error(500))
+    action = SimpleNamespace(url="http://galaxy.test/api/jobs/1/files?path=/x&file_type=output")
+    with pytest.raises(requests.HTTPError):
+        rc._collect_output("output", action, "out1")
+
+
+def test_collect_output_reraises_infra_oserror_for_workdir_output():
+    """An infrastructure OSError (e.g. disk full) collecting a working-directory
+    output must fail the job rather than be downgraded to an allowed failure."""
+    rc = _results_collector_with_failing_collect(OSError("No space left on device"))
+    action = SimpleNamespace(path="/pulsar/working/out.dat")
+    with pytest.raises(OSError):
+        rc._collect_output("output_workdir", action, "out1")
+
+
+def test_collect_output_tolerates_missing_workdir_output():
+    """A missing from_work_dir output (FileNotFoundError) is an expected,
+    recoverable condition for a working-directory output, so it is an allowed
+    failure and must not raise."""
+    rc = _results_collector_with_failing_collect(FileNotFoundError("out.dat"))
+    action = SimpleNamespace(path="/pulsar/working/out.dat")
+    assert rc._collect_output("output_workdir", action, "out1") is None
+
+
+def test_collect_output_reraises_transport_error_for_workdir_output():
+    """A transport failure staging out a working-directory output must fail the
+    job. Downgrading it is how a successful job ends up green in Galaxy with
+    zero-length outputs. PulsarClientTransportError is not an OSError, so it has
+    to be recognized explicitly."""
+    rc = _results_collector_with_failing_collect(
+        PulsarClientTransportError(transport_code=500, transport_message="POST failed")
+    )
+    action = SimpleNamespace(url="http://galaxy.test/api/jobs/1/files?path=/x&file_type=output")
+    with pytest.raises(PulsarClientTransportError):
+        rc._collect_output("output_workdir", action, "out1")
+
+
+def test_collect_output_tolerates_403_transport_error_for_workdir_output():
+    """The 403 carve-out is keyed on the status code, not the exception class, so
+    it applies to a transport error carrying 403 just as it does to a
+    requests.HTTPError."""
+    rc = _results_collector_with_failing_collect(PulsarClientTransportError(transport_code=403))
+    action = SimpleNamespace(url="http://galaxy.test/api/jobs/1/files?path=/x&file_type=output")
+    assert rc._collect_output("output_workdir", action, "out1") is False

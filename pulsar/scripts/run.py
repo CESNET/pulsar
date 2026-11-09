@@ -4,13 +4,13 @@ import fnmatch
 import sys
 import uuid
 
-from pulsar.client import (
+from pulsar.client.staging.down import finish_job
+from pulsar.client.staging.models import (
     ClientJobDescription,
     ClientOutputs,
-    finish_job,
     PulsarOutputs,
-    submit_job,
 )
+from pulsar.client.staging.up import submit_job
 from pulsar.client.test.check import (
     client_info,
     extract_client_options,
@@ -97,7 +97,8 @@ def _run_client_for_job(args):
         result_status = waiter.wait()
         pulsar_outputs = PulsarOutputs.from_status_response(result_status)
         if args.result_json:
-            open(args.result_json, "w").write(json_dumps(result_status))
+            with open(args.result_json, "w") as fh:
+                fh.write(json_dumps(result_status))
         finish_args = dict(
             client=client,
             job_completed_normally=True,

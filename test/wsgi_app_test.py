@@ -1,17 +1,18 @@
 import json
 import os
-import time
 from urllib.parse import quote
 
 from pulsar import __version__ as pulsar_version
+from .test_utils import (
+    test_pulsar_app,
+    wait_for,
+)
 
 
 def test_standard_requests():
     """ Tests app controller methods. These tests should be
     compartmentalized. Also these methods should be made to not retest
     the behavior of the associated Manager class. """
-    from .test_utils import test_pulsar_app
-
     with test_pulsar_app(test_conf={"extra_environ": {"REMOTE_ADDR": "127.101.101.98"}}) as app:
         staging_directory = app.app.staging_directory
         setup_response = app.post("/jobs?job_id=12345")
@@ -23,7 +24,7 @@ def test_standard_requests():
         job_id = setup_config["job_id"]
 
         def test_upload(upload_type):
-            url = "/jobs/{}/files?name=input1&type={}".format(job_id, upload_type)
+            url = f"/jobs/{job_id}/files?name=input1&type={upload_type}"
             upload_input_response = app.post(url, "Test Contents")
             upload_input_config = json.loads(upload_input_response.body.decode("utf-8"))
             staged_input_path = upload_input_config["path"]
@@ -50,16 +51,12 @@ def test_standard_requests():
             pass
 
         command_line = quote("""python -c "import sys; sys.stdout.write('test_out')" """)
-        launch_response = app.post("/jobs/{}/submit?command_line={}".format(job_id, command_line))
+        launch_response = app.post(f"/jobs/{job_id}/submit?command_line={command_line}")
         assert launch_response.body.decode("utf-8") == 'OK'
 
-        # Hack: Call twice to ensure postprocessing occurs and has time to
-        # complete. Monitor thread should get this.
-        time.sleep(.3)
-        check_response = app.get("/jobs/%s/status" % job_id)
-        time.sleep(.3)
-        check_response = app.get("/jobs/%s/status" % job_id)
-        check_config = json.loads(check_response.body.decode("utf-8"))
+        # The monitor thread finishes the job in the background; poll rather
+        # than sleep a fixed time, since postprocessing time varies by host.
+        check_config = _wait_for_complete_status(app, job_id)
         assert check_config['returncode'] == 0
         assert check_config['job_stdout'] == "test_out"
         assert check_config['job_stderr'] == ""
@@ -75,3 +72,13 @@ def test_standard_requests():
         healthz_response = app.get("/healthz")
         healthz_data = json.loads(healthz_response.body.decode("utf-8"))
         assert healthz_data["version"] == pulsar_version
+
+
+def _wait_for_complete_status(app, job_id, timeout=10):
+    return wait_for(
+        lambda: json.loads(app.get("/jobs/%s/status" % job_id).body.decode("utf-8")),
+        f"job {job_id} to complete",
+        until=lambda status: status["complete"] == "true",
+        timeout=timeout,
+        interval=.05,
+    )

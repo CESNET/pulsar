@@ -10,18 +10,30 @@ from time import (
 from typing import Optional
 
 from packaging.version import parse as parse_version
-try:
-    import kombu
-    import kombu.exceptions
-    from kombu import pools
-except ImportError:
-    kombu = None
 
 try:
-    import amqp
-    import amqp.exceptions
+    from kombu import __version__ as kombu_version
+    from kombu.connection import Connection
+    from kombu.entity import (
+        Exchange,
+        Queue,
+    )
+    from kombu.exceptions import OperationalError
+    from kombu.messaging import Consumer
+    from kombu.pools import producers
+    KOMBU_AVAILABLE = True
 except ImportError:
-    amqp = None
+    KOMBU_AVAILABLE = False
+
+try:
+    from amqp.exceptions import (
+        ConnectionForced,
+        RecoverableChannelError,
+        RecoverableConnectionError,
+    )
+    AMQP_AVAILABLE = True
+except ImportError:
+    AMQP_AVAILABLE = False
 
 log = logging.getLogger(__name__)
 
@@ -74,12 +86,14 @@ class PulsarExchange:
         publish_uuid_store=None,
         consume_uuid_store=None,
         republish_time=DEFAULT_REPUBLISH_TIME,
+        durable=True,
+        heartbeat=DEFAULT_HEARTBEAT,
     ):
         """
         """
-        if not kombu:
+        if not KOMBU_AVAILABLE:
             raise Exception(KOMBU_UNAVAILABLE)
-        if not amqp:
+        if not AMQP_AVAILABLE:
             raise Exception(AMQP_UNAVAILABLE)
         # conditional imports and type checking prevent us from doing this at the module level.
         self.recoverable_exceptions = (
@@ -89,23 +103,29 @@ class PulsarExchange:
             # Needed as long as py-ampq raises plain OSError:
             # https://github.com/celery/py-amqp/blob/a92dd037712b5b7b1622f4f9d83157d095c90910/amqp/transport.py#L584
             OSError,
-            amqp.exceptions.ConnectionForced,  # e.g. connection closed on rabbitmq sigterm
-            amqp.exceptions.RecoverableConnectionError,  # connection closed
-            amqp.exceptions.RecoverableChannelError,  # publish time out
-            kombu.exceptions.OperationalError,  # ConnectionRefusedError, e.g. when getting a new connection while rabbitmq is down
+            ConnectionForced,  # e.g. connection closed on rabbitmq sigterm
+            RecoverableConnectionError,  # connection closed
+            RecoverableChannelError,  # publish time out
+            OperationalError,  # ConnectionRefusedError, e.g. when getting a new connection while rabbitmq is down
         )
-        self.__kombu_version = parse_version(kombu.__version__)
+        self.__kombu_version = parse_version(kombu_version)
         self.__url = url
         self.__manager_name = manager_name
         self.__amqp_key_prefix = amqp_key_prefix
         self.__connect_ssl = connect_ssl
-        self.__exchange = kombu.Exchange(DEFAULT_EXCHANGE_NAME, DEFAULT_EXCHANGE_TYPE)
+        self.__durable = bool(durable)
+        self.__exchange = Exchange(
+            DEFAULT_EXCHANGE_NAME, DEFAULT_EXCHANGE_TYPE, durable=self.__durable,
+        )
         self.__timeout = timeout
         self.__republish_time = republish_time
+        # 0 disables heartbeats; py-amqp raises TypeError on a non-numeric value
+        # and that is not a recoverable exception, so normalize here as well as
+        # in the factory to protect direct construction.
+        self.__heartbeat = int(heartbeat or 0)
         # Be sure to log message publishing failures.
-        if publish_kwds.get("retry", False):
-            if "retry_policy" not in publish_kwds:
-                publish_kwds["retry_policy"] = {}
+        if publish_kwds.get("retry", False) and "retry_policy" not in publish_kwds:
+            publish_kwds["retry_policy"] = {}
         self.__publish_kwds = publish_kwds
         self.publish_uuid_store = publish_uuid_store
         self.consume_uuid_store = consume_uuid_store
@@ -118,7 +138,7 @@ class PulsarExchange:
 
     @staticmethod
     def __publish_errback(exc, interval, publish_log_prefix=""):
-        log.error("%sConnection error while publishing: %r", publish_log_prefix, exc, exc_info=1)
+        log.error("%sConnection error while publishing: %r", publish_log_prefix, exc, exc_info=exc)
         log.info("%sRetrying in %s seconds", publish_log_prefix, interval)
 
     @property
@@ -129,7 +149,11 @@ class PulsarExchange:
     def acks_enabled(self):
         return self.publish_uuid_store is not None
 
-    def consume(self, queue_name, callback, check=True, connection_kwargs={}):
+    def consume(self, queue_name, callback, check=True, connection_kwargs=None):
+        # Copy rather than mutate: a shared default dict here would apply one
+        # exchange's heartbeat to every later consumer in the process.
+        connection_kwargs = dict(connection_kwargs or {})
+        connection_kwargs.setdefault("heartbeat", self.__heartbeat)
         queue = self.__queue(queue_name)
         log.debug("Consuming queue '%s'", queue)
         callbacks = [self.__ack_callback]
@@ -138,9 +162,10 @@ class PulsarExchange:
         while check:
             heartbeat_thread = None
             try:
-                with self.connection(self.__url, heartbeat=DEFAULT_HEARTBEAT, **connection_kwargs) as connection:
-                    with kombu.Consumer(connection, queues=[queue], callbacks=callbacks, accept=['json']):
-                        heartbeat_thread = self.__start_heartbeat(queue_name, connection)
+                with self.connection(self.__url, **connection_kwargs) as connection:
+                    with Consumer(connection, queues=[queue], callbacks=callbacks, accept=['json']):
+                        if self.__heartbeat:
+                            heartbeat_thread = self.__start_heartbeat(queue_name, connection)
                         while check and connection.connected:
                             try:
                                 connection.drain_events(timeout=self.__timeout)
@@ -229,19 +254,18 @@ class PulsarExchange:
             payload[ACK_SUBMIT_QUEUE_KEY] = name
             self.publish_uuid_store[ack_uuid] = payload
             log.debug('Requesting acknowledgement of UUID %s on queue %s', ack_uuid, ack_queue)
-        with self.connection(self.__url) as connection:
-            with pools.producers[connection].acquire() as producer:
-                log.debug("%sHave producer for publishing to key %s", publish_log_prefix, key)
-                publish_kwds = self.__prepare_publish_kwds(publish_log_prefix)
-                producer.publish(
-                    payload,
-                    serializer='json',
-                    exchange=self.__exchange,
-                    declare=[self.__exchange],
-                    routing_key=key,
-                    **publish_kwds
-                )
-                log.debug("%sPublished to key %s", publish_log_prefix, key)
+        with self.connection(self.__url) as connection, producers[connection].acquire(block=True) as producer:
+            log.debug("%sHave producer for publishing to key %s", publish_log_prefix, key)
+            publish_kwds = self.__prepare_publish_kwds(publish_log_prefix)
+            producer.publish(
+                payload,
+                serializer='json',
+                exchange=self.__exchange,
+                declare=[self.__exchange],
+                routing_key=key,
+                **publish_kwds
+            )
+            log.debug("%sPublished to key %s", publish_log_prefix, key)
 
     def ack_manager(self):
         log.debug('Acknowledgement manager thread alive')
@@ -250,7 +274,7 @@ class PulsarExchange:
             while True:
                 sleep(DEFAULT_ACK_MANAGER_SLEEP)
                 with self.publish_ack_lock:
-                    for unack_uuid in self.publish_uuid_store.keys():
+                    for unack_uuid in self.publish_uuid_store:
                         if self.publish_uuid_store.get_time(unack_uuid) < time() - self.__republish_time:
                             payload = self.__get_payload(unack_uuid, failed)
                             if payload is None:
@@ -301,10 +325,12 @@ class PulsarExchange:
                 return PulsarExchange.__publish_errback(exc, interval, publish_log_prefix)
             publish_kwds["retry_policy"]["errback"] = errback
         else:
-            publish_kwds = self.__publish_kwds
+            publish_kwds = dict(self.__publish_kwds)
         if self.__kombu_version < MINIMUM_KOMBU_VERSION_PUBLISH_TIMEOUT:
-            log.warning(f"kombu version {kombu.__version__} does not support timeout argument to publish. Consider updating to 5.2.0 or newer")
+            log.warning(f"kombu version {kombu_version} does not support timeout argument to publish. Consider updating to 5.2.0 or newer")
             publish_kwds.pop("timeout", None)
+        if self.__durable and "delivery_mode" not in publish_kwds:
+            publish_kwds["delivery_mode"] = 2
         return publish_kwds
 
     def __publish_log_prefex(self, transaction_uuid=None):
@@ -316,16 +342,21 @@ class PulsarExchange:
     def connection(self, connection_string, **kwargs):
         if "ssl" not in kwargs:
             kwargs["ssl"] = self.__connect_ssl
-        return kombu.Connection(connection_string, **kwargs)
+        return Connection(connection_string, **kwargs)
 
     def __queue(self, name):
         queue_name = self.__queue_name(name)
-        queue = kombu.Queue(queue_name, self.__exchange, routing_key=queue_name)
+        queue = Queue(
+            queue_name,
+            self.__exchange,
+            routing_key=queue_name,
+            durable=self.__durable,
+        )
         return queue
 
     def __queue_name(self, name):
         key_prefix = self.__key_prefix()
-        queue_name = '{}_{}'.format(key_prefix, name)
+        queue_name = f'{key_prefix}_{name}'
         return queue_name
 
     def __key_prefix(self):

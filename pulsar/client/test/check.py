@@ -18,17 +18,19 @@ from collections import namedtuple
 from galaxy.tool_util.deps.dependencies import DependenciesDescription
 from galaxy.tool_util.deps.requirements import ToolRequirement
 
-from pulsar.client import (
-    build_client_manager,
+from pulsar.client.coexecution_manager import build_client_manager
+from pulsar.client.staging.down import finish_job
+from pulsar.client.staging.inputs import (
     CLIENT_INPUT_PATH_TYPES,
     ClientInput,
     ClientInputs,
+)
+from pulsar.client.staging.models import (
     ClientJobDescription,
     ClientOutputs,
-    finish_job,
     PulsarOutputs,
-    submit_job,
 )
+from pulsar.client.staging.up import submit_job
 from .test_common import write_config
 
 TEST_SCRIPT = b"""# -*- coding: utf-8 -*-
@@ -410,7 +412,7 @@ class Waiter:
 
 def __assert_contents(path, expected_contents, pulsar_state):
     if not os.path.exists(path):
-        raise AssertionError("File {} not created. Final Pulsar response state [{}]".format(path, pulsar_state))
+        raise AssertionError(f"File {path} not created. Final Pulsar response state [{pulsar_state}]")
     if isinstance(expected_contents, bytes):
         file = open(path, 'rb')
     else:
@@ -418,8 +420,8 @@ def __assert_contents(path, expected_contents, pulsar_state):
     try:
         contents = file.read()
         if contents != expected_contents:
-            message = "File ({}) contained invalid contents [{}].".format(path, contents)
-            message = "{} Expected contents [{}]. Final Pulsar response state [{}]".format(message, expected_contents, pulsar_state)
+            message = f"File ({path}) contained invalid contents [{contents}]."
+            message = f"{message} Expected contents [{expected_contents}]. Final Pulsar response state [{pulsar_state}]"
             raise AssertionError(message)
     finally:
         file.close()
@@ -453,18 +455,18 @@ def __client(temp_directory, options):
     default_file_action = client_options.get("default_file_action", None)
     unstructured_action = default_file_action or "transfer"
     path_defs = [
-        dict(path=os.path.join(temp_directory, "idx"), path_types="unstructured", depth=2, action=unstructured_action),
+        {"path": os.path.join(temp_directory, "idx"), "path_types": "unstructured", "depth": 2, "action": unstructured_action},
     ]
     if getattr(options, "test_rewrite_action", False):
-        rewrite_def = dict(
-            path=os.path.join(temp_directory, "shared"),
-            path_types="unstructured",
-            action="rewrite",
-            source_directory=os.path.join(temp_directory, "shared"),
-            destination_directory=os.path.join(temp_directory, "shared2")
-        )
+        rewrite_def = {
+            "path": os.path.join(temp_directory, "shared"),
+            "path_types": "unstructured",
+            "action": "rewrite",
+            "source_directory": os.path.join(temp_directory, "shared"),
+            "destination_directory": os.path.join(temp_directory, "shared2")
+        }
         path_defs.append(rewrite_def)
-    client_options["file_action_config"] = write_config(temp_directory, dict(paths=path_defs))
+    client_options["file_action_config"] = write_config(temp_directory, {"paths": path_defs})
     if default_file_action in ["remote_scp_transfer", "remote_rsync_transfer"]:
         test_key = os.environ["PULSAR_TEST_KEY"]
         if not test_key.startswith("----"):
@@ -560,10 +562,15 @@ def __extra_job_description_kwargs(options):
     test_env = getattr(options, "test_env", False)
     env = []
     if test_env:
-        env.append(dict(name="TEST_ENV", value="TEST_ENV_VALUE"))
+        env.append({"name": "TEST_ENV", "value": "TEST_ENV_VALUE"})
     container = getattr(options, "container", None)
     remote_pulsar_app_config = getattr(options, "remote_pulsar_app_config", None)
-    rval = dict(dependencies_description=dependencies_description, env=env, container=container, remote_pulsar_app_config=remote_pulsar_app_config)
+    rval = {
+        "dependencies_description": dependencies_description,
+        "env": env,
+        "container": container,
+        "remote_pulsar_app_config": remote_pulsar_app_config,
+    }
     if getattr(options, "explicit_tool_declarations", False):
         rval["tool_directory_required_files"] = TestRequiredFilesObject()
     return rval
@@ -574,13 +581,13 @@ def __finish(options, client, client_outputs, result_status):
     cleanup_job = 'always'
     if not getattr(options, 'cleanup', True):
         cleanup_job = 'never'
-    finish_args = dict(
-        client=client,
-        job_completed_normally=True,
-        cleanup_job=cleanup_job,  # Default should 'always' if overridden via options.
-        client_outputs=client_outputs,
-        pulsar_outputs=pulsar_outputs,
-    )
+    finish_args = {
+        "client": client,
+        "job_completed_normally": True,
+        "cleanup_job": cleanup_job,  # Default should 'always' if overridden via options.
+        "client_outputs": client_outputs,
+        "pulsar_outputs": pulsar_outputs,
+    }
     failed = finish_job(**finish_args)
     if failed:
         failed_message_template = "Failed to complete job correctly, final status %s, finish exceptions %s."
@@ -603,7 +610,7 @@ def main(argv=None):
     parser.add_option('--explicit_tool_declarations', default=False, action="store_true")
     parser.add_option('--legacy_galaxy_json', default=False, action="store_true")
     parser.add_option('--debug', default=False, action="store_true", help=HELP_DEBUG)
-    (options, args) = parser.parse_args(argv)
+    (options, _args) = parser.parse_args(argv)
     run(options)
 
 
