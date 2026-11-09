@@ -115,6 +115,14 @@ class StatefulManagerProxy(ManagerProxy):
         self.__postprocess_action_executor = RetryActionExecutor(
             **postprocess_retry_action_kwds
         )
+        # Server-side (app.yml) defaults for SSH-backed staging actions
+        # (remote_rsync_transfer, remote_scp_transfer). Options configured per
+        # path in Galaxy's file actions mapping take precedence.
+        self.__transfer_options = {
+            "recursive": manager_options.get("staging_recursive", False),
+            "ssh_options": manager_options.get("staging_ssh_options"),
+            "rsync_options": manager_options.get("staging_rsync_options"),
+        }
         self.min_polling_interval = dt.timedelta(0, min_polling_interval)
         self.active_jobs = ActiveJobs.from_manager(manager)
         self.__state_change_callback = self._default_status_change_callback
@@ -246,6 +254,7 @@ class StatefulManagerProxy(ManagerProxy):
                     self.__preprocess_action_executor,
                     was_cancelled,
                     object_store=self.object_store,
+                    transfer_options=self.__transfer_options,
                 )
                 self.active_jobs.deactivate_job(
                     job_id, active_status=ACTIVE_STATUS_PREPROCESSING
@@ -421,7 +430,10 @@ class StatefulManagerProxy(ManagerProxy):
             try:
                 self._finish_live_output(job_id)
                 postprocess_success = postprocess(
-                    job_directory, self.__postprocess_action_executor, was_cancelled
+                    job_directory,
+                    self.__postprocess_action_executor,
+                    was_cancelled,
+                    transfer_options=self.__transfer_options,
                 )
             except Exception:
                 log.exception("Failed to postprocess results for job id %s" % job_id)

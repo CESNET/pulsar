@@ -9,6 +9,24 @@
 #    type: queued_python
 #    num_concurrent_jobs: 1
 #    min_polling_interval: 0.5
+#    ## Options applied by the Pulsar server to SSH-based staging actions
+#    ## (remote_rsync_transfer and remote_scp_transfer file actions). These are
+#    ## defaults only - options set per-path in Galaxy's file actions mapping
+#    ## take precedence.
+#    ## Stage directories recursively (adds -r to rsync/scp).
+#    #staging_recursive: false
+#    ## Extra arguments for the rsync command line (list or space-separated
+#    ## string), e.g. compression or bandwidth limits.
+#    #staging_rsync_options: ["-z", "--bwlimit=50000"]
+#    ## Arguments for the ssh command used by rsync (-e) and scp (list or
+#    ## space-separated string). Unset, Pulsar's defaults are used
+#    ## (-o StrictHostKeyChecking=no -o PreferredAuthentications=publickey
+#    ## -o PubkeyAuthentication=yes). Set, they REPLACE those defaults - use
+#    ## the `*defaults*` token to keep them, e.g. to only add compression:
+#    #staging_ssh_options: ["*defaults*", "-o", "Compression=yes"]
+#    ## or to replace one of them (ssh keeps the first -o of a kind, so the
+#    ## replacement must come first):
+#    #staging_ssh_options: ["-o", "StrictHostKeyChecking=yes", "*defaults*"]
 #    ## Run jobs under cvmfsexec (https://github.com/cvmfs/cvmfsexec) so CVMFS
 #    ## repositories are available without a system-wide /cvmfs mount. This can
 #    ## also be set/overridden per-destination from Galaxy (a `cvmfsexec` job
