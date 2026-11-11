@@ -1,6 +1,6 @@
 from enum import Enum
 from logging import getLogger
-from os import sep
+from os import sep, walk
 from os.path import (
     abspath,
     basename,
@@ -18,6 +18,8 @@ from typing import (
     Optional,
     TYPE_CHECKING,
 )
+
+from galaxy.util import asbool
 
 from . import COMMAND_VERSION_FILENAME
 from .inputs import CLIENT_INPUT_PATH_TYPES
@@ -141,6 +143,7 @@ class FileStager:
             self.job_inputs,
             self.rewrite_paths,
             self.job_directory,
+            staging_recursive=self.staging_recursive,
         )
 
         self.__initialize_referenced_tool_files()
@@ -185,6 +188,14 @@ class FileStager:
             self.client.assign_job_id(self.job_id)
         self.job_config = job_config
         self.job_directory = self.__setup_job_directory()
+        # If the Pulsar server has staging_recursive enabled it advertises it
+        # in the job setup information - directories that support recursive
+        # transfer (dataset extra_files) are then staged as a single recursive
+        # transfer instead of one transfer per file. With a locally built job
+        # config (message queue setups) the equivalent Galaxy destination
+        # parameter is remote_property_staging_recursive.
+        system_properties = job_config.get("system_properties", {}) or {}
+        self.staging_recursive = asbool(system_properties.get("staging_recursive", False))
 
     def __setup_touch_outputs(self, touch_outputs):
         self.job_config['touch_outputs'] = touch_outputs
@@ -465,7 +476,7 @@ class JobInputs:
 
 class TransferTracker:
 
-    def __init__(self, client, path_helper, action_mapper, job_inputs, rewrite_paths, job_directory):
+    def __init__(self, client, path_helper, action_mapper, job_inputs, rewrite_paths, job_directory, staging_recursive=False):
         self.client = client
         self.path_helper = path_helper
         self.action_mapper = action_mapper
@@ -473,6 +484,7 @@ class TransferTracker:
         self.job_inputs = job_inputs
         self.rewrite_paths = rewrite_paths
         self.job_directory = job_directory
+        self.staging_recursive = staging_recursive
         self.file_renames = {}
         self.remote_staging_actions = []
 
@@ -502,6 +514,18 @@ class TransferTracker:
                 self.__add_remote_staging_input(action, None, type)
                 return
 
+            if (
+                self.staging_recursive
+                and action.staging_needed
+                and not action.staging_action_local
+                and getattr(action, "recursive_directory_transfer_supported", False)
+            ):
+                # Recursive staging is on - transfer the whole directory (e.g.
+                # a dataset's extra_files) with a single recursive transfer
+                # instead of one transfer action per file.
+                self.__transfer_directory_recursively(action, action_source, type)
+                return
+
             directory = action_source["path"]
         else:
             assert action_source is None
@@ -518,6 +542,27 @@ class TransferTracker:
                 relpath(directory_file_path, rel_path_to)
             )
             self.handle_transfer_path(directory_file_path, type, name=remote_name)
+
+    def __transfer_directory_recursively(self, action, action_source, type):
+        directory = action_source["path"]
+        job_directory = self.job_directory
+        assert job_directory, "job directory required for action %s" % action
+        # One recursive transfer of the whole directory, the markers are
+        # interpreted by the Pulsar server executing the action.
+        action.recursive = True
+        action.directory = True
+        register = self.rewrite_paths or type == "tool"  # Mirrors handle_transfer_source.
+        if register:
+            # Register the same per-file renames walking the directory would
+            # have produced - just without transferring the files one by one.
+            rel_path_to = dirname(directory)
+            for root, _, files in walk(directory):
+                for file_name in files:
+                    file_path = join(root, file_name)
+                    remote_name = self.path_helper.remote_name(relpath(file_path, rel_path_to))
+                    remote_path = job_directory.calculate_path(remote_name, type)
+                    self.register_rewrite(file_path, remote_path, type)
+        self.__add_remote_staging_input(action, basename(directory), type)
 
     def handle_transfer_source(self, source, type, name=None, contents=None):
         action = self.__action_for_transfer(source, type, contents)

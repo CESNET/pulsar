@@ -13,7 +13,10 @@
 #    ## (remote_rsync_transfer and remote_scp_transfer file actions). These are
 #    ## defaults only - options set per-path in Galaxy's file actions mapping
 #    ## take precedence.
-#    ## Stage directories recursively (adds -r to rsync/scp).
+#    ## Stage directories recursively (adds -r to rsync/scp). For rsync/scp
+#    ## file actions this also makes a Pulsar client stage a dataset's
+#    ## extra_files directory as a single recursive transfer instead of one
+#    ## transfer per file.
 #    #staging_recursive: false
 #    ## Extra arguments for the rsync command line (list or space-separated
 #    ## string), e.g. compression or bandwidth limits.
