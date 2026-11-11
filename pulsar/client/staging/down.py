@@ -4,6 +4,7 @@ from contextlib import contextmanager
 from json import loads
 from logging import getLogger
 from os.path import (
+    dirname,
     join,
     relpath,
 )
@@ -122,8 +123,19 @@ class ResultsCollector:
             if output_generated:
                 self._attempt_collect_output('output', output_file)
 
-            for galaxy_path, pulsar in self.pulsar_outputs.output_extras(output_file).items():
-                self._attempt_collect_output('output', path=galaxy_path, name=pulsar)
+            extras = self.pulsar_outputs.output_extras(output_file)
+            if extras:
+                # Stage the whole extra_files directory out with a single
+                # recursive transfer when the collector supports it, instead
+                # of one transfer per file.
+                directory = self.pulsar_outputs.output_extra_files_directory(output_file)
+                galaxy_directory = join(
+                    dirname(output_file),
+                    self.pulsar_outputs.path_helper.local_name(directory),
+                )
+                if not self._attempt_collect_output_directory('output', galaxy_directory, directory):
+                    for galaxy_path, pulsar in extras.items():
+                        self._attempt_collect_output('output', path=galaxy_path, name=pulsar)
             # else not output generated, do not attempt download.
 
     def __collect_version_file(self):
@@ -192,6 +204,8 @@ class ResultsCollector:
             return
 
         dynamic_file_source_references = self.__realized_dynamic_file_source_references()
+        extra_files_directories = [r.rstrip("/") for r in dynamic_file_source_references["extra_files"] if r]
+        collapsed_directories = set()
 
         # Fetch remaining working directory outputs of interest.
         for name in contents:
@@ -204,12 +218,46 @@ class ResultsCollector:
                 collect = True
 
             if collect:
+                containing_directory = next((d for d in extra_files_directories if name.startswith(d + "/")), None)
+                if containing_directory and containing_directory in collapsed_directories:
+                    continue  # already staged out with the whole-directory transfer
                 output_file = join(directory, self.pulsar_outputs.path_helper.local_name(name))
                 if (name, output_file) in self.downloaded_working_directory_files:
                     continue
+                if containing_directory:
+                    galaxy_directory = join(directory, self.pulsar_outputs.path_helper.local_name(containing_directory))
+                    if self._attempt_collect_output_directory(output_type, galaxy_directory, containing_directory):
+                        collapsed_directories.add(containing_directory)
+                        for collapsed_name in contents:
+                            if collapsed_name.startswith(containing_directory + "/"):
+                                collapsed_output_file = join(directory, self.pulsar_outputs.path_helper.local_name(collapsed_name))
+                                self.downloaded_working_directory_files.append((collapsed_name, collapsed_output_file))
+                        continue
                 log.debug(f"collecting dynamic {output_type} file {name}")
                 if self._attempt_collect_output(output_type=output_type, path=output_file, name=name):
                     self.downloaded_working_directory_files.append((name, output_file))
+
+    def _attempt_collect_output_directory(self, output_type, path, name):
+        """Stage out a whole directory with a single recursive transfer.
+
+        Only engaged when the mapped action can transfer directories
+        recursively (rsync/scp) *and* recursive staging is on for it - on the
+        Pulsar server side that comes from app.yml staging_recursive (the
+        client-side mapper leaves it unset). Returns False when not engaged
+        so callers fall back to collecting the files one by one.
+        """
+        action = self.action_mapper.action({"path": path}, output_type)
+        resolve_transfer_options = getattr(action, "resolved_transfer_options", None)
+        if resolve_transfer_options is None:
+            return False
+        if not (action.staging_needed and not action.staging_action_local):
+            return False
+        if not resolve_transfer_options()[0]:  # recursive
+            return False
+        action.directory = True
+        with self.exception_tracker():
+            collected = bool(self._collect_output(output_type, action, name))
+        return collected
 
     def _attempt_collect_output(self, output_type, path, name=None):
         # path is final path on galaxy server (client)

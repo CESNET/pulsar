@@ -281,6 +281,11 @@ class PulsarOutputs:
     def has_output_file(self, output_file):
         return basename(output_file) in self.output_directory_contents
 
+    def output_extra_files_directory(self, output_file):
+        """Name (relative to the output directory) of the extra_files
+        directory belonging to output_file, e.g. dataset_1_files."""
+        return "{}_files".format(basename(output_file)[0:-len(".dat")])
+
     def output_extras(self, output_file):
         """
         Returns dict mapping local path to remote name.
@@ -290,6 +295,6 @@ class PulsarOutputs:
         def local_path(name):
             return join(output_directory, self.path_helper.local_name(name))
 
-        files_directory = "{}_files{}".format(basename(output_file)[0:-len(".dat")], self.path_helper.separator)
+        files_directory = self.output_extra_files_directory(output_file) + self.path_helper.separator
         names = filter(lambda o: o.startswith(files_directory), self.output_directory_contents)
         return {local_path(name): name for name in names}

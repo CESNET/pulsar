@@ -651,7 +651,11 @@ class RsyncTransferAction(PubkeyAuthenticatedTransferAction):
                            rsync_options=rsync_options, ssh_options=ssh_options)
 
     def write_from_path(self, pulsar_path):
-        recursive, ssh_options, rsync_options, _ = self.resolved_transfer_options()
+        recursive, ssh_options, rsync_options, directory = self.resolved_transfer_options()
+        if directory and recursive and not pulsar_path.endswith("/"):
+            # Trailing slash for the same idempotence as write_to_path - the
+            # destination directory on the client may already exist on retries.
+            pulsar_path += "/"
         with self._serialized_key() as key_file:
             rsync_post_file(pulsar_path, self.path, self.ssh_user,
                             self.ssh_host, self.ssh_port, key_file,
@@ -686,9 +690,14 @@ class ScpTransferAction(PubkeyAuthenticatedTransferAction):
                          ssh_options=ssh_options)
 
     def write_from_path(self, pulsar_path):
-        recursive, ssh_options, _, _ = self.resolved_transfer_options()
+        recursive, ssh_options, _, directory = self.resolved_transfer_options()
+        destination = self.path
+        if directory and recursive:
+            # scp -r recreates the source directory inside the destination,
+            # so transfer into the destination's parent directory.
+            destination = dirname(destination)
         with self._serialized_key() as key_file:
-            scp_post_file(pulsar_path, self.path, self.ssh_user, self.ssh_host,
+            scp_post_file(pulsar_path, destination, self.ssh_user, self.ssh_host,
                           self.ssh_port, key_file, recursive=recursive,
                           ssh_options=ssh_options)
 

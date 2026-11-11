@@ -1,3 +1,4 @@
+import json
 from contextlib import contextmanager
 from unittest import mock
 
@@ -5,10 +6,16 @@ from galaxy.util.bunch import Bunch
 
 from pulsar.client import action_mapper
 from pulsar.client.action_mapper import (
+    UNSET_ACTION_KWD,
     FileActionMapper,
     from_dict,
 )
 from pulsar.client.job_directory import RemoteJobDirectory
+from pulsar.client.staging.down import ResultsCollector
+from pulsar.client.staging.models import (
+    ClientOutputs,
+    PulsarOutputs,
+)
 from pulsar.client.staging.up import (
     StageDirectoryType,
     TransferTracker,
@@ -202,6 +209,97 @@ def _tracker(staging_recursive):
         job_directory=job_directory,
         staging_recursive=staging_recursive,
     )
+
+
+class _RecordingOutputCollector:
+    """Minimal output collector that records collect_output calls and reports success."""
+
+    def __init__(self):
+        self.calls = []
+
+    def collect_output(self, results_collector, output_type, action, name):
+        self.calls.append((output_type, getattr(action, "action_type", None), name, getattr(action, "directory", UNSET_ACTION_KWD)))
+        return True
+
+
+def _results_collector(transfer_defaults):
+    mapper = FileActionMapper(config=_rsync_config(default_action="remote_rsync_transfer"), transfer_defaults=transfer_defaults)
+    collector = _RecordingOutputCollector()
+    client_outputs = ClientOutputs(working_directory="/galaxy/wd", output_files=["/galaxy/outputs/out1.dat"])
+    pulsar_outputs = PulsarOutputs(
+        [],
+        ["out1.dat", "out1_files/a.txt", "out1_files/sub/b.txt", "out1_files/c.txt"],
+        [],
+        [],
+        remote_separator="/",
+    )
+    return ResultsCollector(collector, mapper, client_outputs, pulsar_outputs), collector
+
+
+def test_output_extra_files_recursive_single_collection():
+    # Pulsar server with staging_recursive: the output dataset's extra_files
+    # come back as ONE whole-directory collection, not one per file.
+    collector_rc, collector = _results_collector({"recursive": True})
+    collector_rc.collect()
+    directory_calls = [c for c in collector.calls if c[3] is True]
+    assert len(directory_calls) == 1
+    assert directory_calls[0][2] == "out1_files"
+    collected_names = [c[2] for c in collector.calls]
+    assert "out1_files/a.txt" not in collected_names
+    assert "out1_files/sub/b.txt" not in collected_names
+    assert "out1_files/c.txt" not in collected_names
+
+
+def test_output_extra_files_non_recursive_one_per_file():
+    # Without recursive staging the per-file collection is preserved.
+    collector_rc, collector = _results_collector({})
+    collector_rc.collect()
+    collected_names = [c[2] for c in collector.calls]
+    assert "out1_files/a.txt" in collected_names
+    assert "out1_files/sub/b.txt" in collected_names
+    assert "out1_files/c.txt" in collected_names
+    assert [c for c in collector.calls if c[3] is True] == []
+
+
+def test_output_extra_files_discovered_directory_recursive():
+    # discovered_datasets (galaxy.json extra_files reference) also collapse to
+    # one whole-directory collection when recursive staging is on.
+    transfer_defaults = {"recursive": True}
+    mapper = FileActionMapper(config=_rsync_config(default_action="remote_rsync_transfer"), transfer_defaults=transfer_defaults)
+    collector = _RecordingOutputCollector()
+    galaxy_json = json.dumps({"collections": {"col1": {"type": "list", "extra_files": "col1_extra"}}})
+    client_outputs = ClientOutputs(working_directory="/galaxy/wd", output_files=[])
+    pulsar_outputs = PulsarOutputs(
+        ["col1_extra/x.txt", "col1_extra/sub/y.txt"],
+        [],
+        [],
+        [],
+        remote_separator="/",
+        realized_dynamic_file_sources=[{"contents": galaxy_json, "type": "galaxy", "path": "galaxy.json"}],
+    )
+    ResultsCollector(collector, mapper, client_outputs, pulsar_outputs).collect()
+    directory_calls = [c for c in collector.calls if c[3] is True]
+    assert len(directory_calls) == 1
+    assert directory_calls[0][2] == "col1_extra"
+    collected_names = [c[2] for c in collector.calls]
+    assert "col1_extra/x.txt" not in collected_names
+
+
+def test_rsync_directory_post_is_idempotent():
+    # The server stages a whole directory out with -r and a trailing slash on
+    # the Pulsar source (so retries merge instead of nesting), the client
+    # destination keeps its name.
+    mapper = FileActionMapper(config=_rsync_config(default_action="remote_rsync_transfer"), transfer_defaults={"recursive": True})
+    action = mapper.action({"path": "/galaxy/outputs/out1_files"}, "output")
+    action.recursive = True
+    action.directory = True
+    with _captured_calls() as captured:
+        action.write_from_path("/pulsar/staging/outputs/out1_files")
+    cmd = captured[-1]  # captured[0] is the ensure_dir mkdir
+    assert "-r" in cmd
+    # Pulsar source keeps a trailing slash; Galaxy destination (remote here) does not.
+    assert cmd[-2] == "/pulsar/staging/outputs/out1_files/"
+    assert cmd[-1] == "user@host:/galaxy/outputs/out1_files"
 
 
 def test_scp_transfer_recursive_and_ssh_options():
