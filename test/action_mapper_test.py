@@ -8,7 +8,13 @@ from pulsar.client.action_mapper import (
     FileActionMapper,
     from_dict,
 )
+from pulsar.client.job_directory import RemoteJobDirectory
+from pulsar.client.staging.up import (
+    StageDirectoryType,
+    TransferTracker,
+)
 from pulsar.client.transport import ssh
+from pulsar.client.util import PathHelper
 
 
 def test_endpoint_validation():
@@ -128,6 +134,74 @@ def test_transfer_defaults_do_not_break_legacy_actions():
     cmd = captured[0]
     assert cmd[0] == "rsync"
     assert "-r" not in cmd
+
+
+def test_recursive_extra_files_single_action(tmp_path):
+    # With recursive staging on, a dataset extra_files directory collapses to
+    # one remote action (recursive, whole-directory) instead of one per file.
+    extra_files = tmp_path / "dataset_1_files"
+    (extra_files / "sub").mkdir(parents=True)
+    (extra_files / "a.txt").write_text("a")
+    (extra_files / "b.txt").write_text("b")
+    (extra_files / "sub" / "c.txt").write_text("c")
+
+    tracker = _tracker(staging_recursive=True)
+    tracker.handle_transfer_directory(
+        "input",
+        action_source={"path": str(extra_files), "object_store_ref": None},
+        mode=StageDirectoryType.WHOLE_DIRECTORY,
+    )
+    assert len(tracker.remote_staging_actions) == 1
+    staged_action = tracker.remote_staging_actions[0]["action"]
+    assert tracker.remote_staging_actions[0]["name"] == "dataset_1_files"
+    assert staged_action["recursive"] is True
+    assert staged_action["directory"] is True
+    # Every file (including in subdirs) still gets a path rewrite.
+    assert tracker.file_renames[str(extra_files / "a.txt")] == "/staging/inputs/dataset_1_files/a.txt"
+    assert tracker.file_renames[str(extra_files / "sub" / "c.txt")] == "/staging/inputs/dataset_1_files/sub/c.txt"
+
+    # The whole-directory action transfers with -r and a trailing slash so
+    # retries stay idempotent (contents into the destination, not nested).
+    server_action = from_dict(_inject_ssh_key(dict(staged_action)))
+    with _captured_calls() as captured:
+        server_action.write_to_path("/staging/inputs/dataset_1_files")
+    cmd = captured[0]
+    assert cmd[0] == "rsync"
+    assert "-r" in cmd
+    remote_source = cmd[-2]
+    local_dest = cmd[-1]
+    assert remote_source.endswith("dataset_1_files/")
+    assert local_dest == "/staging/inputs/dataset_1_files"
+
+
+def test_non_recursive_extra_files_one_action_per_file(tmp_path):
+    extra_files = tmp_path / "dataset_1_files"
+    extra_files.mkdir()
+    (extra_files / "a.txt").write_text("a")
+    (extra_files / "b.txt").write_text("b")
+
+    tracker = _tracker(staging_recursive=False)
+    tracker.handle_transfer_directory(
+        "input",
+        action_source={"path": str(extra_files), "object_store_ref": None},
+        mode=StageDirectoryType.WHOLE_DIRECTORY,
+    )
+    # Default behavior preserved: the directory is walked, one action per file.
+    assert len(tracker.remote_staging_actions) == 2
+
+
+def _tracker(staging_recursive):
+    action_mapper_instance = FileActionMapper(config=_rsync_config())
+    job_directory = RemoteJobDirectory("/staging", remote_id=None, remote_sep="/")
+    return TransferTracker(
+        client=None,
+        path_helper=PathHelper("/"),
+        action_mapper=action_mapper_instance,
+        job_inputs=None,
+        rewrite_paths=True,
+        job_directory=job_directory,
+        staging_recursive=staging_recursive,
+    )
 
 
 def test_scp_transfer_recursive_and_ssh_options():

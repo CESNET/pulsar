@@ -41,6 +41,7 @@ from typing import (
 from uuid import uuid4
 
 from galaxy.util import (
+    asbool,
     shrink_stream_by_size,
     smart_str,
 )
@@ -143,7 +144,7 @@ class BaseManager(ManagerInterface, ABC):
         self.debug = str(kwds.get("debug", False)).lower() == "true"
         self.authorizer = app.authorizer
         self.user_auth_manager = app.user_auth_manager
-        self.__init_system_properties()
+        self.__init_system_properties(kwds)
         self.__init_env_vars(**kwds)
         self.dependency_manager = app.dependency_manager
         self.job_metrics = app.job_metrics
@@ -178,10 +179,16 @@ class BaseManager(ManagerInterface, ABC):
             "galaxy_datatypes_config_file", None
         )
 
-    def __init_system_properties(self) -> None:
+    def __init_system_properties(self, kwds: Optional[Dict[str, Any]] = None) -> None:
+        kwds = kwds or {}
         system_properties: Dict[str, Any] = {
             "separator": sep,
         }
+        # Advertise recursive staging so Pulsar clients can stage recursive-capable
+        # directories (e.g. dataset extra_files) as a single recursive transfer
+        # instead of one transfer action per file.
+        if asbool(kwds.get("staging_recursive", False)):
+            system_properties["staging_recursive"] = True
         galaxy_home = self._galaxy_home()
         if galaxy_home:
             system_properties["galaxy_home"] = galaxy_home

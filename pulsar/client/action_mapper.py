@@ -553,6 +553,9 @@ class PubkeyAuthenticatedTransferAction(BaseAction):
     """
     inject_ssh_properties = True
     inject_transfer_options = True
+    # These transports can transfer a whole directory with one recursive
+    # invocation (rsync -r / scp -r).
+    recursive_directory_transfer_supported = True
     action_spec: ClassVar[Dict[str, Any]] = {
         'ssh_key': UNSET_ACTION_KWD,
         'ssh_user': UNSET_ACTION_KWD,
@@ -561,13 +564,14 @@ class PubkeyAuthenticatedTransferAction(BaseAction):
         'recursive': UNSET_ACTION_KWD,
         'ssh_options': UNSET_ACTION_KWD,
         'rsync_options': UNSET_ACTION_KWD,
+        'directory': UNSET_ACTION_KWD,
     }
     staging = STAGING_ACTION_REMOTE
 
     def __init__(self, source, file_lister=None, ssh_user=UNSET_ACTION_KWD,
                  ssh_host=UNSET_ACTION_KWD, ssh_port=UNSET_ACTION_KWD, ssh_key=UNSET_ACTION_KWD,
                  recursive=UNSET_ACTION_KWD, ssh_options=UNSET_ACTION_KWD,
-                 rsync_options=UNSET_ACTION_KWD):
+                 rsync_options=UNSET_ACTION_KWD, directory=UNSET_ACTION_KWD):
         super().__init__(source, file_lister=file_lister)
         self.ssh_user = ssh_user
         self.ssh_host = ssh_host
@@ -576,6 +580,7 @@ class PubkeyAuthenticatedTransferAction(BaseAction):
         self.recursive = recursive
         self.ssh_options = ssh_options
         self.rsync_options = rsync_options
+        self.directory = directory
 
     def to_dict(self):
         return self._extend_base_dict(
@@ -584,7 +589,8 @@ class PubkeyAuthenticatedTransferAction(BaseAction):
             ssh_port=self.ssh_port,
             recursive=self.recursive,
             ssh_options=self.ssh_options,
-            rsync_options=self.rsync_options
+            rsync_options=self.rsync_options,
+            directory=self.directory
         )
 
     def resolved_transfer_options(self):
@@ -593,7 +599,8 @@ class PubkeyAuthenticatedTransferAction(BaseAction):
         recursive = _as_bool(self.recursive) if self.recursive != UNSET_ACTION_KWD else False
         ssh_options = _option_list(self.ssh_options)
         rsync_options = _option_list(self.rsync_options)
-        return recursive, ssh_options, rsync_options
+        directory = _as_bool(self.directory) if self.directory != UNSET_ACTION_KWD else False
+        return recursive, ssh_options, rsync_options, directory
 
     @contextmanager
     def _serialized_key(self):
@@ -626,17 +633,25 @@ class RsyncTransferAction(PubkeyAuthenticatedTransferAction):
                                    ssh_key=action_dict["ssh_key"],
                                    recursive=action_dict.get("recursive", UNSET_ACTION_KWD),
                                    ssh_options=action_dict.get("ssh_options", UNSET_ACTION_KWD),
-                                   rsync_options=action_dict.get("rsync_options", UNSET_ACTION_KWD))
+                                   rsync_options=action_dict.get("rsync_options", UNSET_ACTION_KWD),
+                                   directory=action_dict.get("directory", UNSET_ACTION_KWD))
 
     def write_to_path(self, path):
-        recursive, ssh_options, rsync_options = self.resolved_transfer_options()
+        recursive, ssh_options, rsync_options, directory = self.resolved_transfer_options()
+        uri_from = self.path
+        if directory and recursive and not uri_from.endswith("/"):
+            # rsync copies a directory's *contents* into a destination that
+            # does not exist yet, but nests the source inside one that does.
+            # The trailing slash makes the whole-directory transfer idempotent
+            # across staging retries.
+            uri_from += "/"
         with self._serialized_key() as key_file:
-            rsync_get_file(self.path, path, self.ssh_user, self.ssh_host,
+            rsync_get_file(uri_from, path, self.ssh_user, self.ssh_host,
                            self.ssh_port, key_file, recursive=recursive,
                            rsync_options=rsync_options, ssh_options=ssh_options)
 
     def write_from_path(self, pulsar_path):
-        recursive, ssh_options, rsync_options = self.resolved_transfer_options()
+        recursive, ssh_options, rsync_options, _ = self.resolved_transfer_options()
         with self._serialized_key() as key_file:
             rsync_post_file(pulsar_path, self.path, self.ssh_user,
                             self.ssh_host, self.ssh_port, key_file,
@@ -655,17 +670,23 @@ class ScpTransferAction(PubkeyAuthenticatedTransferAction):
                                  ssh_port=action_dict["ssh_port"],
                                  ssh_key=action_dict["ssh_key"],
                                  recursive=action_dict.get("recursive", UNSET_ACTION_KWD),
-                                 ssh_options=action_dict.get("ssh_options", UNSET_ACTION_KWD))
+                                 ssh_options=action_dict.get("ssh_options", UNSET_ACTION_KWD),
+                                 directory=action_dict.get("directory", UNSET_ACTION_KWD))
 
     def write_to_path(self, path):
-        recursive, ssh_options, _ = self.resolved_transfer_options()
+        recursive, ssh_options, _, directory = self.resolved_transfer_options()
+        if directory and recursive:
+            # scp -r places the source directory *inside* an existing
+            # destination directory, so target its parent - the source
+            # basename becomes the destination name.
+            path = dirname(path)
         with self._serialized_key() as key_file:
             scp_get_file(self.path, path, self.ssh_user, self.ssh_host,
                          self.ssh_port, key_file, recursive=recursive,
                          ssh_options=ssh_options)
 
     def write_from_path(self, pulsar_path):
-        recursive, ssh_options, _ = self.resolved_transfer_options()
+        recursive, ssh_options, _, _ = self.resolved_transfer_options()
         with self._serialized_key() as key_file:
             scp_post_file(pulsar_path, self.path, self.ssh_user, self.ssh_host,
                           self.ssh_port, key_file, recursive=recursive,
