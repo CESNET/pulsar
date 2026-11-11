@@ -175,6 +175,9 @@ class PulsarServerOutputCollector:
         transferred = self.action_executor.execute(action_if_not_cancelled, description)
         if self.metrics is not None and action.staging_needed and transferred:
             self.metrics.record_file(pulsar_path)
+        # ResultsCollector uses the outcome to record the collection (e.g. to
+        # skip files already staged out with a whole-directory transfer).
+        return transferred
 
 
 def __pulsar_outputs(job_directory: "JobDirectory") -> PulsarOutputs:
